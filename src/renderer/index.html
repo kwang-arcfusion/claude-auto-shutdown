@@ -33,9 +33,13 @@
       <section class="panel">
         <div class="panel-head">
           <span class="panel-title" data-i18n="ui.sessions">Sessions</span>
-          <span id="lastCheck" class="faint"></span>
-          <button id="pollBtn" class="icon-btn" type="button" data-i18n-title="ui.checkNow" data-i18n-aria="ui.checkNow">
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+          <button id="pollBtn" class="icon-btn poll" type="button" data-i18n-aria="ui.checkNow">
+            <!-- Counts down to the next check: the arc empties clockwise, then refills after the check. -->
+            <svg class="ring" viewBox="0 0 28 28" aria-hidden="true">
+              <circle class="ring-track" cx="14" cy="14" r="12" />
+              <circle id="pollRing" class="ring-left empty" cx="14" cy="14" r="12" transform="rotate(-90 14 14)" />
+            </svg>
+            <svg class="glyph" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
               <path d="M20 11a8 8 0 1 0-2.4 5.7" />
               <path d="M20 4v7h-7" />
             </svg>

@@ -56,6 +56,7 @@ export class Controller {
   private executingSince: number | null = null;
   private lastDetection: DetectionResult | null = null;
   private nextPollAt: number | null = null;
+  private nextPollTotalMs: number | null = null;
   private log: LogEntry[] = [];
   private inFlight: { promise: Promise<DetectionResult>; thorough: boolean } | null = null;
   private finalCheckRunning: Promise<void> | null = null;
@@ -79,8 +80,10 @@ export class Controller {
     return this.dryRunForced || this.settings.dryRun;
   }
 
-  setNextPollAt(at: number | null): void {
+  /** When the next check runs, and how long the wait for it is (the window draws it as a ring). */
+  setNextPollAt(at: number | null, totalMs: number | null = null): void {
     this.nextPollAt = at;
+    this.nextPollTotalMs = totalMs;
   }
 
   state(): AppState {
@@ -92,6 +95,7 @@ export class Controller {
       countdownTotalMs: this.countdownTotalMs,
       lastDetection: this.lastDetection,
       nextPollAt: this.nextPollAt,
+      nextPollTotalMs: this.nextPollTotalMs,
       settings: this.settings,
       effectiveDryRun: this.effectiveDryRun,
       dryRunForced: this.dryRunForced,

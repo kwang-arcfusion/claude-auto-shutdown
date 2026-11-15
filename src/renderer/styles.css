@@ -239,6 +239,45 @@ body {
   height: 16px;
 }
 
+/* "Check now" with a ring that counts down to the next check. It steps once a second from
+   script and is never animated: continuous animation costs CPU all night. */
+.icon-btn.poll {
+  border-radius: 50%;
+}
+
+.icon-btn.poll > svg {
+  grid-area: 1 / 1;
+}
+
+.icon-btn.poll .ring {
+  width: 28px;
+  height: 28px;
+  fill: none;
+  stroke-width: 2;
+}
+
+.icon-btn.poll .glyph {
+  width: 12px;
+  height: 12px;
+}
+
+.ring-track {
+  stroke: var(--line);
+}
+
+.ring-left {
+  stroke: var(--muted);
+  stroke-linecap: round;
+}
+
+.icon-btn.poll:hover .ring-left {
+  stroke: var(--text);
+}
+
+.ring-left.empty {
+  visibility: hidden;
+}
+
 /* ---- panels -------------------------------------------------------------- */
 .panel {
   background: var(--surface);

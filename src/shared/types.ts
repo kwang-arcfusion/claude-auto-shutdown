@@ -107,7 +107,10 @@ export interface AppState {
   /** Length of the running countdown (a real shutdown gets at least a minute). */
   countdownTotalMs: number | null;
   lastDetection: DetectionResult | null;
+  /** When the next check runs; in the past while a check is running. */
   nextPollAt: number | null;
+  /** Length of the wait for that check, for the countdown ring. */
+  nextPollTotalMs: number | null;
   settings: Settings;
   effectiveDryRun: boolean;
   dryRunForced: boolean;

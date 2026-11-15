@@ -361,3 +361,11 @@ test('updateSettings clamps values and ignores invalid ones', () => {
   assert.equal(s.action, 'shutdown');
   assert.equal(s.countdownMinutes, 7);
 });
+
+test('the next check time and the length of the wait are in the state (for the countdown ring)', () => {
+  const h = harness();
+  h.controller.setNextPollAt(1_030_000, 30_000);
+  const s = h.controller.state();
+  assert.equal(s.nextPollAt, 1_030_000);
+  assert.equal(s.nextPollTotalMs, 30_000);
+});

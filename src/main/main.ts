@@ -283,10 +283,11 @@ function main(): void {
     if (pollTimer) clearTimeout(pollTimer);
     let ms = delayMs ?? controller.getSettings().pollIntervalSec * 1000;
     if (controller.getPhase() === 'countdown') ms = Math.min(ms, 15_000);
-    controller.setNextPollAt(Date.now() + ms);
+    controller.setNextPollAt(Date.now() + ms, ms);
+    pushState(); // the window's ring counts down to this check
     pollTimer = setTimeout(() => {
       pollTimer = null;
-      controller.setNextPollAt(null);
+      // nextPollAt stays in the past while the check runs: the ring shows it as empty.
       const options = pollThoroughly ? { thorough: true } : {};
       pollThoroughly = false;
       controller

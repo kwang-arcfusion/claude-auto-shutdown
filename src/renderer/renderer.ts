@@ -4,8 +4,8 @@ import type { AppState, LogEntry, SessionInfo, SessionVerdict, Settings } from '
 
 const api = (window as unknown as { api?: Api }).api;
 
-function byId<T extends HTMLElement = HTMLElement>(id: string): T {
-  const node = document.getElementById(id);
+function byId<T extends Element = HTMLElement>(id: string): T {
+  const node: Element | null = document.getElementById(id); // also finds SVG elements
   if (!node) throw new Error(`missing #${id}`);
   return node as T;
 }
@@ -19,8 +19,8 @@ const ui = {
   progressBar: byId('progressBar'),
   phaseSub: byId('phaseSub'),
   primaryBtn: byId<HTMLButtonElement>('primaryBtn'),
-  lastCheck: byId('lastCheck'),
   pollBtn: byId<HTMLButtonElement>('pollBtn'),
+  pollRing: byId<SVGCircleElement>('pollRing'),
   detectError: byId('detectError'),
   sessionList: byId<HTMLUListElement>('sessionList'),
   noSessions: byId('noSessions'),
@@ -52,6 +52,9 @@ const NUMBER_FIELDS = [
   'backgroundCpuPercent',
 ] as const;
 const BOOLEAN_FIELDS = ['forceCloseApps', 'cancelOnUserActivity', 'preventSleepWhileArmed', 'dryRun'] as const;
+
+/** Circumference of the countdown ring (r = 12 in index.html). */
+const RING_LENGTH = 2 * Math.PI * 12;
 
 let state: AppState | null = null;
 let lang: Language = 'en';
@@ -192,10 +195,20 @@ function sessionRow(session: SessionInfo): HTMLLIElement {
   return row;
 }
 
-function renderLastCheck(s: AppState): void {
-  const detection = s.lastDetection;
-  ui.lastCheck.textContent = detection ? ago(detection.at) : '';
-  ui.lastCheck.title = detection ? t('ui.lastCheckAt', { at: detection.at }) : '';
+/** The ring around "check now" empties clockwise until the next check, then refills. */
+function renderPollRing(s: AppState): void {
+  const left = s.nextPollAt === null ? 0 : Math.max(0, s.nextPollAt - Date.now());
+  const total = s.nextPollTotalMs ?? 0;
+  const remaining = total > 0 ? Math.min(1, left / total) : 0;
+  ui.pollRing.setAttribute('stroke-dashoffset', (-(1 - remaining) * RING_LENGTH).toFixed(2));
+  ui.pollRing.classList.toggle('empty', remaining <= 0);
+  ui.pollBtn.title = [
+    t('ui.checkNow'),
+    left > 0 ? t('ui.nextCheckIn', { left: clock(left) }) : t('ui.checking'),
+    s.lastDetection ? t('ui.lastCheckAt', { at: s.lastDetection.at }) : '',
+  ]
+    .filter(Boolean)
+    .join('\n');
 }
 
 function renderSessions(s: AppState): void {
@@ -257,11 +270,11 @@ function fillSettings(s: AppState): void {
   force.closest('.row')?.classList.toggle('disabled', force.disabled);
 }
 
-/** Every second, only what changes with time (timers, "x minutes ago"); nothing while hidden. */
+/** Every second, only what changes with time (timers, the ring); nothing while hidden. */
 function tick(): void {
   if (!state || document.hidden) return;
   renderHero(state);
-  renderLastCheck(state);
+  renderPollRing(state);
 }
 
 /** On new state from the main process: everything, including the session list and the log. */
@@ -273,7 +286,7 @@ function applyState(next: AppState): void {
   renderLog(next);
   renderSessions(next);
   renderHero(next);
-  renderLastCheck(next);
+  renderPollRing(next);
 }
 
 function flashSaved(): void {
@@ -288,6 +301,7 @@ if (!api) {
   ui.phaseLabel.textContent = t('ui.noPreload');
 } else {
   const bridge = api;
+  ui.pollRing.setAttribute('stroke-dasharray', RING_LENGTH.toFixed(2));
   void bridge.getState().then(applyState);
   bridge.onState(applyState);
   setInterval(tick, 1000);
