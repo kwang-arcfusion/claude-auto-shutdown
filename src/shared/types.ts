@@ -7,6 +7,10 @@ export interface Settings {
   idleConfirmMinutes: number;
   /** Countdown length before the action runs. */
   countdownMinutes: number;
+  /** Waiting this long for the user's answer (permission prompt, question) counts as finished. 0 turns this off. */
+  waitingMinutes: number;
+  /** A command Claude started (e.g. a background task) showing no activity this long counts as hung. 0 turns this off. */
+  toolStallMinutes: number;
   /** A busy session with no activity for this long counts as finished. 0 turns this off. */
   stalledMinutes: number;
   action: ActionKind;
@@ -35,7 +39,9 @@ export type SessionVerdict =
   | 'background'
   /** Waiting on the user (permission prompt or question). */
   | 'waiting'
-  /** Busy, but nothing has happened for stalledMinutes: counts as finished. */
+  /** Turn over, but Claude scheduled itself to continue later (ScheduleWakeup). */
+  | 'scheduled'
+  /** Stuck (unanswered prompt, hung command, long silence): counts as finished. */
   | 'stalled'
   | 'idle';
 

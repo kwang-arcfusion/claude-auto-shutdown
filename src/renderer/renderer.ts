@@ -37,11 +37,20 @@ const VERDICT: Record<SessionVerdict, { label: string; tone: string }> = {
   tool: { label: 'รันคำสั่ง', tone: 'busy' },
   background: { label: 'เบื้องหลัง', tone: 'busy' },
   waiting: { label: 'รอตอบ', tone: 'warn' },
+  scheduled: { label: 'ตั้งเวลาไว้', tone: 'busy' },
   stalled: { label: 'ค้าง', tone: 'idle' },
   idle: { label: 'ว่าง', tone: 'idle' },
 };
 
-const NUMBER_FIELDS = ['pollIntervalSec', 'idleConfirmMinutes', 'countdownMinutes', 'stalledMinutes', 'backgroundCpuPercent'] as const;
+const NUMBER_FIELDS = [
+  'pollIntervalSec',
+  'idleConfirmMinutes',
+  'countdownMinutes',
+  'waitingMinutes',
+  'toolStallMinutes',
+  'stalledMinutes',
+  'backgroundCpuPercent',
+] as const;
 const BOOLEAN_FIELDS = ['forceCloseApps', 'cancelOnUserActivity', 'preventSleepWhileArmed', 'dryRun'] as const;
 
 let state: AppState | null = null;

@@ -1,8 +1,8 @@
 import { readdir, readFile, stat } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
-import type { Aggregate, DetectionResult, SessionInfo, Settings, TranscriptState } from '../../shared/types';
-import { CpuSampler, procKey, type ProcessSnapshot, type SnapshotSource } from './processes';
+import type { Aggregate, DetectionResult, SessionInfo, Settings } from '../../shared/types';
+import { ActivitySampler, procKey, type ProcActivity, type ProcInfo, type ProcessSnapshot, type SnapshotSource } from './processes';
 import {
   evaluateSession,
   maxOf,
@@ -12,8 +12,18 @@ import {
   type SessionActivity,
   type SessionFile,
 } from './session';
-import { latestMtimeUnder, TranscriptLocator, TranscriptStateCache } from './transcript';
-import { classifyDescendants, indexProcesses, processMatchesSession } from './tree';
+import { latestMtimeUnder, TranscriptInfoCache, TranscriptLocator, type TranscriptInfo } from './transcript';
+import { classifyDescendants, indexProcesses, processMatchesSession, sleepEndsAt } from './tree';
+
+/** Tool processes count as active at or above this CPU use (% of one core)... */
+const TOOL_ACTIVE_CPU_PERCENT = 2;
+/** ...or this much I/O (disk or network). */
+const TOOL_ACTIVE_IO_BYTES_PER_SEC = 1024;
+/** A timed `sleep N` stays active until this long after it should have ended. */
+const SLEEP_GRACE_MS = 60_000;
+/** Subagent transcripts not written for this long are not read. */
+const SUBAGENT_LOOKBACK_MS = 6 * 60 * 60_000;
+const MISSING_RECHECK_MS = 5 * 60_000;
 
 export function defaultClaudeDir(env: NodeJS.ProcessEnv = process.env): string {
   const fromEnv = env.CLAUDE_CONFIG_DIR?.trim();
@@ -45,9 +55,17 @@ export interface DetectOptions {
 export interface ClaudeDetectorOptions {
   claudeDir: () => string;
   snapshotter: SnapshotSource;
+  /** Where Claude Code keeps per-session tool output: <tempRoot>/<hash>/<sessionId>/... */
+  tempRoot?: string;
   now?: () => number;
   isPidAlive?: (pid: number) => boolean;
   sleep?: (ms: number) => Promise<void>;
+}
+
+interface ToolWatch {
+  signature: string;
+  activeAt: number;
+  observedAt: number;
 }
 
 function toInfo(file: SessionFile, activity: SessionActivity, evaluation: Evaluation, processes: ProcessFacts | null): SessionInfo {
@@ -81,19 +99,31 @@ function sortSessions(sessions: SessionInfo[]): SessionInfo[] {
   );
 }
 
+async function isDirectory(dir: string): Promise<boolean> {
+  try {
+    return (await stat(dir)).isDirectory();
+  } catch {
+    return false;
+  }
+}
+
 /**
  * Decides whether any Claude Code session is still working, from
  * `<claudeDir>/sessions/*.json`, the session transcripts and (when needed) the process tree.
  */
 export class ClaudeDetector implements Detector {
-  private readonly sampler = new CpuSampler();
+  private readonly sampler = new ActivitySampler();
   private readonly locator = new TranscriptLocator();
-  private readonly transcripts = new TranscriptStateCache();
+  private readonly transcripts = new TranscriptInfoCache();
+  private readonly toolWatch = new Map<string, ToolWatch>();
+  private readonly tempDirs = new Map<string, { dir: string | null; checkedAt: number }>();
+  private readonly tempRoot: string;
   private readonly now: () => number;
   private readonly pidAlive: (pid: number) => boolean;
   private readonly sleep: (ms: number) => Promise<void>;
 
   constructor(private readonly options: ClaudeDetectorOptions) {
+    this.tempRoot = options.tempRoot ?? path.join(os.tmpdir(), 'claude');
     this.now = options.now ?? Date.now;
     this.pidAlive = options.isPidAlive ?? isPidAlive;
     this.sleep = options.sleep ?? ((ms) => new Promise((resolve) => setTimeout(resolve, ms)));
@@ -141,26 +171,36 @@ export class ClaudeDetector implements Detector {
       return finish(aggregateOf(sessions, fileError), sessions, fileError, false);
     }
 
-    let sample: { snapshot: ProcessSnapshot; cpu: Map<string, number> | null };
+    const maxAgeMs = Math.max(3 * settings.pollIntervalSec * 1000, 120_000);
+    let sample: { snapshot: ProcessSnapshot; usage: Map<string, ProcActivity> | null };
     try {
-      sample = await this.snapshotWithCpu(settings);
+      sample = await this.snapshotWithUsage(maxAgeMs);
     } catch (error) {
       const sessions = cheapInfos();
       return finish(clearlyBusy ? 'busy' : 'unknown', sessions, (error as Error).message, false);
     }
 
+    const checkedAt = this.now();
     const index = indexProcesses(sample.snapshot.procs);
+    const usage = sample.usage;
+    const watched = new Set<string>();
     const sessions: SessionInfo[] = [];
-    live.forEach((file, i) => {
+    for (const [i, file] of live.entries()) {
       const proc = index.byPid.get(file.pid);
-      if (!processMatchesSession(file, proc)) return; // left behind by a process that has exited
+      if (!processMatchesSession(file, proc)) continue; // left behind by a process that has exited
       const { tools, helpers } = classifyDescendants(index, proc);
-      const cpu = sample.cpu;
-      const helperCpuPercent = cpu ? helpers.reduce((sum, p) => sum + (cpu.get(procKey(p)) ?? 0), 0) : null;
-      const processes: ProcessFacts = { tools, helperCpuPercent };
-      const evaluation = evaluateSession({ file, ...activity[i]!, processes, now, settings });
+      const helperCpuPercent = usage ? helpers.reduce((sum, p) => sum + (usage.get(procKey(p))?.cpuPercent ?? 0), 0) : null;
+      let toolsActiveAt: number | null = null;
+      if (tools.length > 0) {
+        const key = `${file.pid}:${file.procStart ?? ''}`;
+        watched.add(key);
+        toolsActiveAt = await this.toolsActiveAt(key, file.sessionId, tools, usage, checkedAt, maxAgeMs);
+      }
+      const processes: ProcessFacts = { tools, helperCpuPercent, toolsActiveAt };
+      const evaluation = evaluateSession({ file, ...activity[i]!, processes, now: checkedAt, settings });
       sessions.push(toInfo(file, activity[i]!, evaluation, processes));
-    });
+    }
+    for (const key of this.toolWatch.keys()) if (!watched.has(key)) this.toolWatch.delete(key);
     return finish(aggregateOf(sessions, fileError), sessions, fileError, true);
   }
 
@@ -187,35 +227,128 @@ export class ClaudeDetector implements Detector {
   private async activityFor(projectsDir: string, file: SessionFile, now: number): Promise<SessionActivity> {
     const transcript = await this.locator.locate(projectsDir, file.sessionId, file.cwd, now);
     let transcriptMtime: number | null = null;
-    let transcriptState: TranscriptState = 'unknown';
+    let info: TranscriptInfo = { state: 'unknown', pendingTools: [], scheduledWakeAt: null };
     let sideActivityAt: number | null = null;
+    let runningSubagentAt: number | null = null;
     if (transcript) {
       try {
-        const info = await stat(transcript);
-        transcriptMtime = info.mtimeMs;
-        transcriptState = await this.transcripts.get(transcript, info.mtimeMs, info.size);
+        const stats = await stat(transcript);
+        transcriptMtime = stats.mtimeMs;
+        info = await this.transcripts.get(transcript, stats.mtimeMs, stats.size);
       } catch {
         // removed between locate and stat
       }
-      sideActivityAt = await latestMtimeUnder(path.join(path.dirname(transcript), file.sessionId));
+      const sessionDir = path.join(path.dirname(transcript), file.sessionId);
+      sideActivityAt = await latestMtimeUnder(sessionDir);
+      runningSubagentAt = await this.runningSubagentAt(sessionDir, now);
     }
     return {
-      transcriptState,
+      transcriptState: info.state,
+      pendingTools: info.pendingTools,
+      scheduledWakeAt: info.scheduledWakeAt,
       lastActivityAt: maxOf(transcriptMtime, file.statusUpdatedAt, file.updatedAt),
       sideActivityAt,
+      runningSubagentAt,
     };
   }
 
-  /** Takes a snapshot; if there is no recent one to compare CPU time with, takes a second one 2 s later. */
-  private async snapshotWithCpu(settings: Settings): Promise<{ snapshot: ProcessSnapshot; cpu: Map<string, number> | null }> {
-    const maxAgeMs = Math.max(3 * settings.pollIntervalSec * 1000, 120_000);
+  /** Latest write among subagent transcripts that are still mid-turn, or null if none are. */
+  private async runningSubagentAt(sessionDir: string, now: number): Promise<number | null> {
+    const dir = path.join(sessionDir, 'subagents');
+    let names: string[];
+    try {
+      names = await readdir(dir);
+    } catch {
+      return null;
+    }
+    let latest: number | null = null;
+    for (const name of names) {
+      if (!name.endsWith('.jsonl')) continue;
+      const file = path.join(dir, name);
+      try {
+        const stats = await stat(file);
+        if (now - stats.mtimeMs > SUBAGENT_LOOKBACK_MS) continue;
+        const info = await this.transcripts.get(file, stats.mtimeMs, stats.size);
+        if (info.state === 'running' && (latest === null || stats.mtimeMs > latest)) latest = stats.mtimeMs;
+      } catch {
+        // removed meanwhile
+      }
+    }
+    return latest;
+  }
+
+  /**
+   * Remembers when a session's tool processes last did anything: used CPU or I/O, wrote
+   * output, started or ended a process, or were inside a timed `sleep`. A gap in
+   * observation counts as activity, so time that was not watched never counts as quiet.
+   */
+  private async toolsActiveAt(
+    key: string,
+    sessionId: string,
+    tools: readonly ProcInfo[],
+    usage: Map<string, ProcActivity> | null,
+    now: number,
+    maxAgeMs: number,
+  ): Promise<number> {
+    const signature = tools
+      .map(procKey)
+      .sort()
+      .join('|');
+    const previous = this.toolWatch.get(key);
+    const watchedBefore = previous !== undefined && now - previous.observedAt <= maxAgeMs;
+    let activeAt = watchedBefore ? previous.activeAt : now;
+    const sum = (pick: (a: ProcActivity) => number): number => tools.reduce((total, p) => total + (usage?.get(procKey(p)) ? pick(usage.get(procKey(p))!) : 0), 0);
+    const sleeping = tools.some((p) => {
+      const end = sleepEndsAt(p);
+      return end !== null && now < end + SLEEP_GRACE_MS;
+    });
+    if (
+      usage === null ||
+      (watchedBefore && previous.signature !== signature) ||
+      sleeping ||
+      sum((a) => a.cpuPercent) >= TOOL_ACTIVE_CPU_PERCENT ||
+      sum((a) => a.ioBytesPerSec) >= TOOL_ACTIVE_IO_BYTES_PER_SEC
+    ) {
+      activeAt = now;
+    }
+    const outputAt = await this.outputActivityAt(sessionId, now);
+    if (outputAt !== null && outputAt > activeAt) activeAt = Math.min(outputAt, now);
+    this.toolWatch.set(key, { signature, activeAt, observedAt: now });
+    return activeAt;
+  }
+
+  /** Latest write to the session's tool output files (background task output and the like). */
+  private async outputActivityAt(sessionId: string, now: number): Promise<number | null> {
+    const cached = this.tempDirs.get(sessionId);
+    let dir = cached?.dir ?? null;
+    if (!cached || (cached.dir === null && now - cached.checkedAt >= MISSING_RECHECK_MS)) {
+      dir = null;
+      try {
+        for (const hash of await readdir(this.tempRoot)) {
+          const candidate = path.join(this.tempRoot, hash, sessionId);
+          if (await isDirectory(candidate)) {
+            dir = candidate;
+            break;
+          }
+        }
+      } catch {
+        dir = null;
+      }
+      if (this.tempDirs.size > 500) this.tempDirs.clear();
+      this.tempDirs.set(sessionId, { dir, checkedAt: now });
+    }
+    return dir ? latestMtimeUnder(dir, 2) : null;
+  }
+
+  /** Takes a snapshot; if there is no recent one to compare with, takes a second one 2 s later. */
+  private async snapshotWithUsage(maxAgeMs: number): Promise<{ snapshot: ProcessSnapshot; usage: Map<string, ProcActivity> | null }> {
     let snapshot = await this.options.snapshotter.take();
-    let cpu = this.sampler.update(snapshot, maxAgeMs);
-    if (!cpu) {
+    let usage = this.sampler.update(snapshot, maxAgeMs);
+    if (!usage) {
       await this.sleep(2_000);
       snapshot = await this.options.snapshotter.take();
-      cpu = this.sampler.update(snapshot, maxAgeMs);
+      usage = this.sampler.update(snapshot, maxAgeMs);
     }
-    return { snapshot, cpu };
+    return { snapshot, usage };
   }
 }

@@ -2,8 +2,10 @@ import type { ActionKind, Settings } from './types';
 
 export const DEFAULT_SETTINGS: Readonly<Settings> = Object.freeze({
   pollIntervalSec: 30,
-  idleConfirmMinutes: 10,
-  countdownMinutes: 20,
+  idleConfirmMinutes: 5,
+  countdownMinutes: 5,
+  waitingMinutes: 5,
+  toolStallMinutes: 20,
   stalledMinutes: 45,
   action: 'shutdown',
   forceCloseApps: true,
@@ -18,6 +20,8 @@ export const LIMITS = {
   pollIntervalSec: { min: 5, max: 3600 },
   idleConfirmMinutes: { min: 0, max: 720 },
   countdownMinutes: { min: 0, max: 720 },
+  waitingMinutes: { min: 0, max: 720 },
+  toolStallMinutes: { min: 0, max: 1440 },
   stalledMinutes: { min: 0, max: 1440 },
   backgroundCpuPercent: { min: 0.5, max: 100 },
 } as const;
@@ -44,6 +48,8 @@ export function sanitizeSettings(raw: unknown, base: Readonly<Settings> = DEFAUL
     pollIntervalSec: Math.round(clampNumber(r.pollIntervalSec, base.pollIntervalSec, LIMITS.pollIntervalSec)),
     idleConfirmMinutes: clampNumber(r.idleConfirmMinutes, base.idleConfirmMinutes, LIMITS.idleConfirmMinutes),
     countdownMinutes: clampNumber(r.countdownMinutes, base.countdownMinutes, LIMITS.countdownMinutes),
+    waitingMinutes: clampNumber(r.waitingMinutes, base.waitingMinutes, LIMITS.waitingMinutes),
+    toolStallMinutes: clampNumber(r.toolStallMinutes, base.toolStallMinutes, LIMITS.toolStallMinutes),
     stalledMinutes: clampNumber(r.stalledMinutes, base.stalledMinutes, LIMITS.stalledMinutes),
     action: ACTIONS.includes(r.action as ActionKind) ? (r.action as ActionKind) : base.action,
     forceCloseApps: bool(r.forceCloseApps, base.forceCloseApps),

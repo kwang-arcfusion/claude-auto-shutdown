@@ -62,6 +62,28 @@ export function classifyDescendants(index: ProcessIndex, root: ProcInfo): Descen
 
 const FILETIME_UNIX_EPOCH_MS = 11_644_473_600_000;
 export const filetimeToMs = (filetime: number): number => filetime / 10_000 - FILETIME_UNIX_EPOCH_MS;
+export const msToFiletime = (ms: number): number => (ms + FILETIME_UNIX_EPOCH_MS) * 10_000;
+
+const SLEEP_UNIT_SECONDS: Record<string, number> = { '': 1, s: 1, m: 60, h: 3600, d: 86400 };
+
+/**
+ * When a deliberate wait will end (ms), for `sleep N[smhd]` (Git Bash coreutils) and
+ * `timeout /t N` (cmd). Null for anything else, including `sleep infinity`.
+ */
+export function sleepEndsAt(p: ProcInfo): number | null {
+  if (!p.created) return null;
+  const name = p.name.toLowerCase();
+  let seconds: number | null = null;
+  if (name === 'sleep.exe') {
+    const match = /sleep(?:\.exe)?"?\s+(\d+(?:\.\d+)?)([smhd]?)(?:\s|$)/i.exec(p.cmd);
+    if (match) seconds = Number(match[1]) * SLEEP_UNIT_SECONDS[match[2]!.toLowerCase()]!;
+  } else if (name === 'timeout.exe') {
+    const match = /\/t\s+(\d+)/i.exec(p.cmd);
+    if (match) seconds = Number(match[1]);
+  }
+  if (seconds === null || !Number.isFinite(seconds)) return null;
+  return filetimeToMs(p.created) + seconds * 1000;
+}
 
 /** 2 seconds in FILETIME ticks. */
 const PROC_START_TOLERANCE = 20_000_000;

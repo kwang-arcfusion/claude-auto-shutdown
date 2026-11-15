@@ -278,7 +278,10 @@ function main(): void {
     win.webContents.setWindowOpenHandler(() => ({ action: 'deny' }));
     win.webContents.on('will-navigate', (event) => event.preventDefault());
     win.once('ready-to-show', () => {
-      if (show) win.show();
+      if (!show) return;
+      // Test runs must not grab focus from whoever is using the machine.
+      if (TEST_MODE) win.showInactive();
+      else win.show();
     });
     win.on('close', (event) => {
       if (quitting || controller.getPhase() === 'disarmed') return;

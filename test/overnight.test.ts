@@ -10,6 +10,7 @@ import { Controller } from '../src/main/controller';
 import { ClaudeDetector } from '../src/main/detector/claude';
 import type { ProcInfo, ProcessSnapshot } from '../src/main/detector/processes';
 import { projectSlug } from '../src/main/detector/transcript';
+import { msToFiletime } from '../src/main/detector/tree';
 import { DEFAULT_SETTINGS } from '../src/shared/settings';
 import type { Phase, Settings } from '../src/shared/types';
 
@@ -38,6 +39,13 @@ interface FakeSession {
   transcript: string;
 }
 
+/** A process Claude started; cpuShare is the fraction of a core it keeps busy. */
+interface FakeTool {
+  proc: Omit<ProcInfo, 'cpuTicks' | 'ioBytes'>;
+  startedAt: number;
+  cpuShare: number;
+}
+
 class Night {
   now = NIGHT_START;
   /** Seconds since the last mouse/keyboard input: asleep by default. */
@@ -48,18 +56,22 @@ class Night {
   readonly controller: Controller;
   private readonly dir = mkdtempSync(path.join(os.tmpdir(), 'cas-night-'));
   private readonly sessions = new Map<number, FakeSession>();
-  private readonly tools = new Map<number, ProcInfo[]>();
+  private readonly tools = new Map<number, FakeTool[]>();
+  private readonly lastToolUse = new Map<number, string>();
   private readonly events: Array<{ at: number; run: () => void }> = [];
   private readonly settings: Settings;
-  private nextToolPid = 50_000;
+  private nextPid = 50_000;
+  private nextId = 1;
   private nextPollAt = NIGHT_START;
 
   constructor(overrides: Partial<Settings> = {}) {
     mkdirSync(path.join(this.dir, 'sessions'));
-    this.settings = { ...DEFAULT_SETTINGS, ...overrides };
+    // The expected times below were worked out with a 10-minute confirm and a 20-minute countdown.
+    this.settings = { ...DEFAULT_SETTINGS, idleConfirmMinutes: 10, countdownMinutes: 20, ...overrides };
     const detector = new ClaudeDetector({
       claudeDir: () => this.dir,
       snapshotter: { take: async () => this.snapshot() },
+      tempRoot: mkdtempSync(path.join(os.tmpdir(), 'cas-night-tmp-')),
       now: () => this.now,
       isPidAlive: (pid) => this.sessions.has(pid),
       sleep: async (ms) => {
@@ -93,9 +105,15 @@ class Night {
     return this;
   }
 
-  /** A busy stretch: the session writes to its transcript every 2 minutes. */
+  /** A busy stretch: one finished tool step every 2 minutes. */
   working(pid: number, from: string, to: string): this {
-    for (let t = T(from); t < T(to); t += 2 * MIN) this.events.push({ at: t, run: () => this.progress(pid) });
+    for (let t = T(from); t < T(to); t += 2 * MIN) this.events.push({ at: t, run: () => this.step(pid) });
+    return this;
+  }
+
+  /** A subagent that writes a step every 2 minutes. */
+  subagentWorking(pid: number, agent: string, from: string, to: string): this {
+    for (let t = T(from); t < T(to); t += 2 * MIN) this.events.push({ at: t, run: () => this.subagentStep(pid, agent) });
     return this;
   }
 
@@ -115,8 +133,10 @@ class Night {
     this.append(pid, { type: 'user', message: { role: 'user', content: 'continue the task' } });
   }
 
-  progress(pid: number): void {
-    this.append(pid, { type: 'assistant', message: { stop_reason: 'tool_use', content: [{ type: 'tool_use', name: 'Edit' }] } });
+  /** One complete tool step: the call and its result. */
+  step(pid: number): void {
+    const id = this.callTool(pid, 'Edit');
+    this.toolResult(pid, id);
   }
 
   reply(pid: number): void {
@@ -125,29 +145,67 @@ class Night {
     this.setStatus(pid, 'idle');
   }
 
-  toolStart(pid: number, cmd: string): void {
-    this.append(pid, { type: 'assistant', message: { stop_reason: 'tool_use', content: [{ type: 'tool_use', name: 'Bash' }] } });
-    this.addTool(pid, cmd);
+  /** A foreground command; cpuShare 0.5 = a build keeping half a core busy. */
+  toolStart(pid: number, cmd: string, cpuShare = 0.5): void {
+    this.callTool(pid, 'Bash');
+    this.addTool(pid, cmd, cpuShare);
   }
 
   toolEnd(pid: number): void {
     this.tools.delete(pid);
-    this.append(pid, { type: 'user', message: { role: 'user', content: [{ type: 'tool_result', content: 'ok' }] } });
+    this.toolResult(pid, this.lastToolUse.get(pid)!);
   }
 
-  /** Asks for permission and then nothing happens, because nobody is awake to answer. */
+  /** Asks for permission to run a command, and nobody is awake to answer. */
   waitForPermission(pid: number): void {
-    this.append(pid, { type: 'assistant', message: { stop_reason: 'tool_use', content: [{ type: 'tool_use', name: 'Bash' }] } });
+    this.callTool(pid, 'Bash');
   }
 
-  /** A run_in_background shell that keeps going after the turn ends. */
-  backgroundStart(pid: number, cmd: string): void {
-    this.toolStart(pid, cmd);
-    this.append(pid, { type: 'user', message: { role: 'user', content: [{ type: 'tool_result', content: 'running in background' }] } });
+  /** Asks the user a question (AskUserQuestion), and nobody answers. */
+  askUser(pid: number): void {
+    this.callTool(pid, 'AskUserQuestion');
+  }
+
+  /** A run_in_background command that keeps going after the turn ends. */
+  backgroundStart(pid: number, cmd: string, options: { cpuShare?: number; sleepSeconds?: number } = {}): void {
+    const id = this.callTool(pid, 'Bash');
+    const shell = this.addTool(pid, cmd, options.cpuShare ?? 0);
+    if (options.sleepSeconds !== undefined) {
+      this.tools.get(pid)!.push({
+        proc: { pid: this.nextPid++, ppid: shell.pid, name: 'sleep.exe', created: msToFiletime(this.now), cmd: `sleep ${options.sleepSeconds}` },
+        startedAt: this.now,
+        cpuShare: 0,
+      });
+    }
+    this.toolResult(pid, id, 'Command running in background');
   }
 
   backgroundEnd(pid: number): void {
     this.tools.delete(pid);
+  }
+
+  /** Starts a background agent: the main turn can end while the subagent keeps working. */
+  spawnBackgroundAgent(pid: number, agent: string): void {
+    const id = this.callTool(pid, 'Agent');
+    this.toolResult(pid, id, 'Agent running in background');
+    this.subagentStep(pid, agent);
+  }
+
+  subagentStep(pid: number, agent: string): void {
+    const id = `toolu_${this.nextId++}`;
+    this.subagentAppend(pid, agent, { type: 'assistant', message: { stop_reason: 'tool_use', content: [{ type: 'tool_use', id, name: 'Read' }] } });
+    this.subagentAppend(pid, agent, { type: 'user', message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: id, content: 'ok' }] } });
+  }
+
+  subagentEnd(pid: number, agent: string): void {
+    this.subagentAppend(pid, agent, { type: 'assistant', message: { stop_reason: 'end_turn', content: [{ type: 'text', text: 'report' }] } });
+  }
+
+  /** ScheduleWakeup (as /loop does), then ends the turn. stop: true ends the loop. */
+  scheduleWakeup(pid: number, input: { delaySeconds?: number; stop?: boolean }): void {
+    const id = this.callTool(pid, 'ScheduleWakeup', input);
+    this.toolResult(pid, id, 'scheduled');
+    this.reply(pid);
   }
 
   /** The process dies and leaves its session file behind (still saying busy). */
@@ -206,6 +264,17 @@ class Night {
     if (this.transitions.at(-1)?.phase !== phase) this.transitions.push({ at: this.now, phase });
   }
 
+  private callTool(pid: number, name: string, input: object = {}): string {
+    const id = `toolu_${this.nextId++}`;
+    this.lastToolUse.set(pid, id);
+    this.append(pid, { type: 'assistant', message: { stop_reason: 'tool_use', content: [{ type: 'tool_use', id, name, input }] } });
+    return id;
+  }
+
+  private toolResult(pid: number, id: string, content = 'ok'): void {
+    this.append(pid, { type: 'user', message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: id, content }] } });
+  }
+
   private writeSessionFile(pid: number): void {
     const s = this.sessions.get(pid)!;
     writeFileSync(
@@ -234,8 +303,16 @@ class Night {
 
   private append(pid: number, entry: object): void {
     const s = this.sessions.get(pid)!;
-    appendFileSync(s.transcript, `${JSON.stringify(entry)}\n`);
+    appendFileSync(s.transcript, `${JSON.stringify({ ...entry, timestamp: new Date(this.now).toISOString() })}\n`);
     this.touch(s.transcript);
+  }
+
+  private subagentAppend(pid: number, agent: string, entry: object): void {
+    const s = this.sessions.get(pid)!;
+    const file = path.join(path.dirname(s.transcript), s.sessionId, 'subagents', `agent-${agent}.jsonl`);
+    mkdirSync(path.dirname(file), { recursive: true });
+    appendFileSync(file, `${JSON.stringify({ ...entry, timestamp: new Date(this.now).toISOString() })}\n`);
+    this.touch(file);
   }
 
   private touch(file: string): void {
@@ -243,34 +320,42 @@ class Night {
     utimesSync(file, time, time);
   }
 
-  private addTool(pid: number, cmd: string): void {
-    const shell: ProcInfo = { pid: this.nextToolPid++, ppid: pid, name: 'bash.exe', created: pid * 1_000 + 500, cpuTicks: 0, cmd: bashTool(cmd) };
-    this.tools.set(pid, [...(this.tools.get(pid) ?? []), shell]);
+  private addTool(pid: number, cmd: string, cpuShare: number): Omit<ProcInfo, 'cpuTicks' | 'ioBytes'> {
+    const proc = { pid: this.nextPid++, ppid: pid, name: 'bash.exe', created: msToFiletime(this.now), cmd: bashTool(cmd) };
+    this.tools.set(pid, [...(this.tools.get(pid) ?? []), { proc, startedAt: this.now, cpuShare }]);
+    return proc;
   }
 
   private snapshot(): ProcessSnapshot {
     if (this.snapshotFails) throw new Error('powershell.exe failed to start');
     const procs: ProcInfo[] = [];
     for (const pid of this.sessions.keys()) {
-      procs.push({ pid, ppid: 1, name: 'claude.exe', created: pid * 1_000, cpuTicks: 0, cmd: 'claude.exe --output-format stream-json' });
-      procs.push({ pid: pid + 1, ppid: pid, name: 'mcp-server.exe', created: pid * 1_000 + 1, cpuTicks: 0, cmd: 'mcp-server.exe --stdio' });
-      procs.push(...(this.tools.get(pid) ?? []));
+      procs.push({ pid, ppid: 1, name: 'claude.exe', created: pid * 1_000, cpuTicks: 0, ioBytes: 0, cmd: 'claude.exe --output-format stream-json' });
+      procs.push({ pid: pid + 1, ppid: pid, name: 'mcp-server.exe', created: pid * 1_000 + 1, cpuTicks: 0, ioBytes: 0, cmd: 'mcp-server.exe --stdio' });
+      for (const tool of this.tools.get(pid) ?? []) {
+        procs.push({ ...tool.proc, cpuTicks: Math.round((this.now - tool.startedAt) * 10_000 * tool.cpuShare), ioBytes: 0 });
+      }
     }
     return { at: this.now, procs };
   }
 }
 
-test('normal night: a 60-minute silent build is not mistaken for idle; shutdown 30 min after the last session', async () => {
+const start = (night: Night, pid = 100, project = 'app'): void => {
+  night.open(pid, project);
+  night.prompt(pid);
+};
+
+// ---- the original scenarios -----------------------------------------------------------
+
+test('normal night: a 60-minute build keeps it on; shutdown 30 min after the last session', async () => {
   const night = new Night();
   night
     .at('23:00', () => {
-      night.open(100, 'api');
-      night.open(200, 'web');
-      night.prompt(100);
-      night.prompt(200);
+      start(night, 100, 'api');
+      start(night, 200, 'web');
     })
     .working(100, '23:00', '00:10')
-    .at('00:10', () => night.toolStart(100, 'npm run build:all')) // transcript silent for an hour
+    .at('00:10', () => night.toolStart(100, 'npm run build:all')) // transcript silent for an hour, CPU busy
     .at('01:10', () => night.toolEnd(100))
     .working(100, '01:10', '02:10')
     .at('02:10', () => night.reply(100))
@@ -281,16 +366,13 @@ test('normal night: a 60-minute silent build is not mistaken for idle; shutdown 
   night.expectShutdownBetween('02:40', '02:42');
 });
 
-test('a background task keeps the machine on after the turn ends, and Claude resumes by itself', async () => {
+test('a busy background task keeps the machine on after the turn ends, and Claude resumes by itself', async () => {
   const night = new Night();
   night
-    .at('23:00', () => {
-      night.open(100, 'ml');
-      night.prompt(100);
-    })
+    .at('23:00', () => start(night))
     .working(100, '23:00', '00:00')
-    .at('00:00', () => night.backgroundStart(100, 'python train.py'))
-    .at('00:01', () => night.reply(100)) // status idle, training still running
+    .at('00:00', () => night.backgroundStart(100, 'python train.py', { cpuShare: 0.8 }))
+    .at('00:01', () => night.reply(100))
     .at('01:20', () => {
       night.backgroundEnd(100);
       night.prompt(100); // woken by the finished task
@@ -305,10 +387,7 @@ test('a background task keeps the machine on after the turn ends, and Claude res
 test('Claude starting again during the countdown cancels it', async () => {
   const night = new Night();
   night
-    .at('23:00', () => {
-      night.open(100, 'app');
-      night.prompt(100);
-    })
+    .at('23:00', () => start(night))
     .working(100, '23:00', '00:30')
     .at('00:30', () => night.reply(100))
     .at('00:50', () => night.prompt(100)) // a queued follow-up starts mid-countdown
@@ -321,40 +400,10 @@ test('Claude starting again during the countdown cancels it', async () => {
   night.expectShutdownBetween('01:45', '01:47');
 });
 
-test('a session stuck on a permission prompt counts as finished after 45 quiet minutes', async () => {
-  const night = new Night();
-  night
-    .at('23:00', () => {
-      night.open(100, 'app');
-      night.prompt(100);
-    })
-    .working(100, '23:00', '00:30')
-    .at('00:30', () => night.waitForPermission(100));
-  await night.run();
-  night.expectNoCountdownBefore('01:15');
-  night.expectShutdownBetween('01:45', '01:47');
-});
-
-test('with the stall rule off, a stuck session keeps the machine on all night', async () => {
-  const night = new Night({ stalledMinutes: 0 });
-  night
-    .at('23:00', () => {
-      night.open(100, 'app');
-      night.prompt(100);
-    })
-    .working(100, '23:00', '00:30')
-    .at('00:30', () => night.waitForPermission(100));
-  await night.run('07:00');
-  night.expectNoShutdown();
-});
-
 test('someone using the computer during the countdown disarms for the night', async () => {
   const night = new Night();
   night
-    .at('23:00', () => {
-      night.open(100, 'app');
-      night.prompt(100);
-    })
+    .at('23:00', () => start(night))
     .working(100, '23:00', '00:30')
     .at('00:30', () => night.reply(100))
     .at('00:45', () => {
@@ -369,10 +418,7 @@ test('someone using the computer during the countdown disarms for the night', as
 test('if process inspection breaks, the machine stays on (never guesses idle)', async () => {
   const night = new Night();
   night
-    .at('23:00', () => {
-      night.open(100, 'app');
-      night.prompt(100);
-    })
+    .at('23:00', () => start(night))
     .working(100, '23:00', '00:30')
     .at('00:20', () => {
       night.snapshotFails = true;
@@ -388,10 +434,7 @@ test('if process inspection breaks, the machine stays on (never guesses idle)', 
 test('if the Claude process dies mid-turn, its leftover "busy" file is ignored', async () => {
   const night = new Night();
   night
-    .at('23:00', () => {
-      night.open(100, 'app');
-      night.prompt(100);
-    })
+    .at('23:00', () => start(night))
     .working(100, '23:00', '01:00')
     .at('01:00', () => night.crash(100));
   await night.run();
@@ -401,14 +444,112 @@ test('if the Claude process dies mid-turn, its leftover "busy" file is ignored',
 test('25 minutes of silent thinking is not treated as finished', async () => {
   const night = new Night();
   night
-    .at('23:00', () => {
-      night.open(100, 'app');
-      night.prompt(100);
-    })
+    .at('23:00', () => start(night))
     .working(100, '23:00', '23:30')
     .working(100, '23:55', '00:30') // nothing written between 23:30 and 23:55
     .at('00:30', () => night.reply(100));
   await night.run();
   night.expectNoCountdownBefore('00:30');
   night.expectShutdownBetween('01:00', '01:02');
+});
+
+// ---- waiting for an answer ----------------------------------------------------------------
+
+test('an unanswered permission prompt counts as finished after 5 minutes', async () => {
+  const night = new Night();
+  night
+    .at('23:00', () => start(night))
+    .working(100, '23:00', '00:30')
+    .at('00:30', () => night.waitForPermission(100));
+  await night.run();
+  night.expectNoCountdownBefore('00:45');
+  night.expectShutdownBetween('01:05', '01:07');
+});
+
+test('an unanswered question counts as finished after 5 minutes', async () => {
+  const night = new Night();
+  night
+    .at('23:00', () => start(night))
+    .working(100, '23:00', '00:30')
+    .at('00:30', () => night.askUser(100));
+  await night.run();
+  night.expectShutdownBetween('01:05', '01:07');
+});
+
+test('with every timeout turned off, an unanswered prompt keeps the machine on all night', async () => {
+  const night = new Night({ waitingMinutes: 0, stalledMinutes: 0 });
+  night
+    .at('23:00', () => start(night))
+    .working(100, '23:00', '00:30')
+    .at('00:30', () => night.waitForPermission(100));
+  await night.run('07:00');
+  night.expectNoShutdown();
+});
+
+// ---- background tasks ----------------------------------------------------------------------
+
+test('a background dev server that just sits there counts as hung after 20 quiet minutes', async () => {
+  const night = new Night();
+  night
+    .at('23:00', () => start(night))
+    .working(100, '23:00', '23:30')
+    .at('23:30', () => night.backgroundStart(100, 'npm run dev', { cpuShare: 0 }))
+    .at('23:31', () => night.reply(100));
+  await night.run();
+  night.expectNoCountdownBefore('23:51');
+  night.expectShutdownBetween('00:21', '00:23');
+});
+
+test('a timed background sleep is waited out; Claude then carries on and finishes', async () => {
+  const night = new Night();
+  night
+    .at('23:00', () => start(night))
+    .working(100, '23:00', '23:30')
+    .at('23:30', () => night.backgroundStart(100, 'sleep 3600 && gh run view', { sleepSeconds: 3600 }))
+    .at('23:31', () => night.reply(100))
+    .at('00:30', () => {
+      night.backgroundEnd(100);
+      night.prompt(100);
+    })
+    .working(100, '00:30', '00:40')
+    .at('00:40', () => night.reply(100));
+  await night.run();
+  night.expectNoCountdownBefore('00:40');
+  night.expectShutdownBetween('01:10', '01:12');
+});
+
+test('a background agent keeps working (with a 40-minute silence) after the main turn ends', async () => {
+  const night = new Night();
+  night
+    .at('23:00', () => start(night))
+    .working(100, '23:00', '00:30')
+    .at('00:30', () => {
+      night.spawnBackgroundAgent(100, 'a1');
+      night.reply(100);
+    })
+    .subagentWorking(100, 'a1', '00:32', '01:00')
+    .subagentWorking(100, 'a1', '01:40', '02:00') // silent 01:00–01:40 while it thinks
+    .at('02:00', () => night.subagentEnd(100, 'a1'));
+  await night.run();
+  night.expectNoCountdownBefore('02:00');
+  night.expectShutdownBetween('02:31', '02:33');
+});
+
+// ---- loops ---------------------------------------------------------------------------------
+
+test('a /loop with scheduled wake-ups keeps the machine on until the loop stops', async () => {
+  const night = new Night();
+  night
+    .at('23:00', () => start(night))
+    .working(100, '23:00', '23:30')
+    .at('23:30', () => night.scheduleWakeup(100, { delaySeconds: 1800 })) // wakes at 00:00
+    .at('00:00', () => night.prompt(100))
+    .working(100, '00:00', '00:10')
+    .at('00:10', () => night.scheduleWakeup(100, { delaySeconds: 1200 })) // wakes at 00:30
+    .at('00:30', () => night.prompt(100))
+    .working(100, '00:30', '00:40')
+    .at('00:40', () => night.scheduleWakeup(100, { stop: true }));
+  await night.run();
+  night.expectNoCountdownBefore('00:40');
+  night.expectShutdownBetween('01:10', '01:12');
 });

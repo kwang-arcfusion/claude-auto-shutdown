@@ -10,6 +10,8 @@ export interface ProcInfo {
   created: number;
   /** Kernel + user CPU time in 100 ns ticks. */
   cpuTicks: number;
+  /** Bytes read, written and transferred otherwise (includes network I/O). */
+  ioBytes: number;
   cmd: string;
 }
 
@@ -24,13 +26,14 @@ export interface SnapshotSource {
 }
 
 /**
- * Lists every process with its parent, creation time, CPU time and command line.
+ * Lists every process with its parent, creation time, CPU time, I/O and command line.
  * Windows PowerShell 5.1 is always present; wmic is not (it is gone on this machine).
  */
 const SNAPSHOT_SCRIPT = String.raw`
 $ErrorActionPreference = 'Stop'
 try { [Console]::OutputEncoding = New-Object System.Text.UTF8Encoding $false } catch { }
-$rows = foreach ($p in Get-CimInstance -ClassName Win32_Process -Property ProcessId,ParentProcessId,Name,CreationDate,KernelModeTime,UserModeTime,CommandLine) {
+$props = 'ProcessId','ParentProcessId','Name','CreationDate','KernelModeTime','UserModeTime','ReadTransferCount','WriteTransferCount','OtherTransferCount','CommandLine'
+$rows = foreach ($p in Get-CimInstance -ClassName Win32_Process -Property $props) {
   $created = '0'
   if ($p.CreationDate) { $created = $p.CreationDate.ToFileTimeUtc().ToString() }
   [pscustomobject]@{
@@ -39,6 +42,7 @@ $rows = foreach ($p in Get-CimInstance -ClassName Win32_Process -Property Proces
     n = [string]$p.Name
     c = $created
     t = ([uint64]$p.KernelModeTime + [uint64]$p.UserModeTime).ToString()
+    io = ([uint64]$p.ReadTransferCount + [uint64]$p.WriteTransferCount + [uint64]$p.OtherTransferCount).ToString()
     cmd = [string]$p.CommandLine
   }
 }
@@ -58,6 +62,7 @@ export function parseSnapshotJson(json: string): ProcInfo[] {
       name: typeof row.n === 'string' ? row.n : '',
       created: Number(row.c) || 0,
       cpuTicks: Number(row.t) || 0,
+      ioBytes: Number(row.io) || 0,
       cmd: typeof row.cmd === 'string' ? row.cmd : '',
     });
   }
@@ -111,30 +116,37 @@ export class PowerShellSnapshotter implements SnapshotSource {
 
 export const procKey = (p: ProcInfo): string => `${p.pid}:${p.created}`;
 
-/** Turns successive snapshots into CPU usage per process (% of one core). */
-export class CpuSampler {
-  private previous: { at: number; ticks: Map<string, number> } | null = null;
+export interface ProcActivity {
+  /** CPU use as % of one core. */
+  cpuPercent: number;
+  ioBytesPerSec: number;
+}
+
+/** Turns successive snapshots into CPU and I/O rates per process. */
+export class ActivitySampler {
+  private previous: { at: number; samples: Map<string, { cpu: number; io: number }> } | null = null;
 
   /**
-   * Records `snapshot` and returns CPU % per process since the previous snapshot,
+   * Records `snapshot` and returns rates per process since the previous snapshot,
    * or null when there is no previous snapshot younger than `maxAgeMs`.
    */
-  update(snapshot: ProcessSnapshot, maxAgeMs: number): Map<string, number> | null {
-    const ticks = new Map<string, number>();
-    for (const p of snapshot.procs) ticks.set(procKey(p), p.cpuTicks);
+  update(snapshot: ProcessSnapshot, maxAgeMs: number): Map<string, ProcActivity> | null {
+    const samples = new Map<string, { cpu: number; io: number }>();
+    for (const p of snapshot.procs) samples.set(procKey(p), { cpu: p.cpuTicks, io: p.ioBytes });
     const previous = this.previous;
-    this.previous = { at: snapshot.at, ticks };
+    this.previous = { at: snapshot.at, samples };
     if (!previous || snapshot.at <= previous.at || snapshot.at - previous.at > maxAgeMs) return null;
 
-    const wallTicks = (snapshot.at - previous.at) * 10_000;
-    const usage = new Map<string, number>();
-    for (const [key, now] of ticks) {
-      const before = previous.ticks.get(key);
+    const seconds = (snapshot.at - previous.at) / 1000;
+    const rates = new Map<string, ProcActivity>();
+    for (const [key, now] of samples) {
       // A process missing from the previous snapshot started inside this window,
-      // so all of its CPU time belongs to the window.
-      const delta = before === undefined ? now : Math.max(0, now - before);
-      usage.set(key, (delta / wallTicks) * 100);
+      // so all of its CPU time and I/O belong to the window.
+      const before = previous.samples.get(key);
+      const cpu = before ? Math.max(0, now.cpu - before.cpu) : now.cpu;
+      const io = before ? Math.max(0, now.io - before.io) : now.io;
+      rates.set(key, { cpuPercent: (cpu / (seconds * 10_000_000)) * 100, ioBytesPerSec: io / seconds });
     }
-    return usage;
+    return rates;
   }
 }

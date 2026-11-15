@@ -6,18 +6,46 @@ import type { TranscriptState } from '../../shared/types';
 const ENDED_SYSTEM_SUBTYPES = new Set(['stop_hook_summary', 'turn_duration']);
 /** Entries written while a model request is in flight. */
 const RUNNING_TYPES = new Set(['api-request', 'api-request-blob', 'progress']);
+/** Assistant stop reasons that do not end the turn. */
+const CONTINUING_STOP_REASONS = new Set(['tool_use', 'pause_turn']);
 
-function firstText(content: unknown): string {
-  if (typeof content === 'string') return content;
-  if (Array.isArray(content)) {
-    for (const block of content) {
-      if (block && typeof block === 'object' && (block as { type?: unknown }).type === 'text') {
-        const text = (block as { text?: unknown }).text;
-        if (typeof text === 'string') return text;
-      }
-    }
+type Entry = Record<string, unknown> & { type: string };
+
+function parseEntry(line: string): Entry | null {
+  const text = line.trim();
+  if (!text) return null;
+  try {
+    const entry = JSON.parse(text) as unknown;
+    return entry !== null && typeof entry === 'object' && typeof (entry as Entry).type === 'string' ? (entry as Entry) : null;
+  } catch {
+    return null; // a partial line at the edge of the read window
   }
+}
+
+const messageOf = (entry: Entry): Record<string, unknown> => (entry.message ?? {}) as Record<string, unknown>;
+
+function blocksOf(entry: Entry): Array<Record<string, unknown>> {
+  const content = messageOf(entry).content;
+  return Array.isArray(content) ? (content.filter((b) => b !== null && typeof b === 'object') as Array<Record<string, unknown>>) : [];
+}
+
+function firstText(entry: Entry): string {
+  const content = messageOf(entry).content;
+  if (typeof content === 'string') return content;
+  for (const block of blocksOf(entry)) if (block.type === 'text' && typeof block.text === 'string') return block.text;
   return '';
+}
+
+const isInterrupt = (entry: Entry): boolean => entry.type === 'user' && firstText(entry).startsWith('[Request interrupted by user');
+
+/** Whether this entry marks the end of a turn. */
+function endsTurn(entry: Entry): boolean {
+  if (entry.type === 'system') return ENDED_SYSTEM_SUBTYPES.has(String(entry.subtype));
+  if (entry.type === 'assistant') {
+    const stop = messageOf(entry).stop_reason;
+    return typeof stop === 'string' && !CONTINUING_STOP_REASONS.has(stop);
+  }
+  return isInterrupt(entry);
 }
 
 /**
@@ -26,36 +54,68 @@ function firstText(content: unknown): string {
  */
 export function classifyTranscriptLines(lines: readonly string[]): TranscriptState {
   for (let i = lines.length - 1; i >= 0; i--) {
-    const line = lines[i]!.trim();
-    if (!line) continue;
-    let entry: Record<string, unknown>;
-    try {
-      entry = JSON.parse(line) as Record<string, unknown>;
-    } catch {
-      continue; // a partial line at the edge of the read window
-    }
-    if (!entry || typeof entry.type !== 'string') continue;
-    const message = (entry.message ?? {}) as Record<string, unknown>;
+    const entry = parseEntry(lines[i]!);
+    if (!entry) continue;
     switch (entry.type) {
       case 'system':
         if (ENDED_SYSTEM_SUBTYPES.has(String(entry.subtype))) return 'ended';
         continue;
-      case 'assistant': {
-        const stop = message.stop_reason;
-        if (stop === 'tool_use' || stop === 'pause_turn' || stop === null || stop === undefined) return 'running';
-        return 'ended';
-      }
-      case 'user': {
+      case 'assistant':
+        return endsTurn(entry) ? 'ended' : 'running';
+      case 'user':
         if (entry.isMeta === true) continue;
-        if (firstText(message.content).startsWith('[Request interrupted by user')) return 'ended';
-        return 'running';
-      }
+        return isInterrupt(entry) ? 'ended' : 'running';
       default:
         if (RUNNING_TYPES.has(entry.type)) return 'running';
         continue;
     }
   }
   return 'unknown';
+}
+
+export interface PendingTool {
+  id: string;
+  name: string;
+  /** When the call was written (ms), if the entry had a timestamp. */
+  at: number | null;
+}
+
+export interface TranscriptInfo {
+  state: TranscriptState;
+  /** Tool calls in the current turn without a result yet: running, or waiting for permission. */
+  pendingTools: PendingTool[];
+  /** When the latest ScheduleWakeup call will wake the session (ms), unless the loop was stopped. */
+  scheduledWakeAt: number | null;
+}
+
+export function analyzeTranscriptLines(lines: readonly string[]): TranscriptInfo {
+  const pending = new Map<string, PendingTool>();
+  let scheduledWakeAt: number | null = null;
+  for (const line of lines) {
+    const entry = parseEntry(line);
+    if (!entry) continue;
+    const parsed = typeof entry.timestamp === 'string' ? Date.parse(entry.timestamp) : Number.NaN;
+    const at = Number.isFinite(parsed) ? parsed : null;
+    if (entry.type === 'assistant') {
+      for (const block of blocksOf(entry)) {
+        if (block.type !== 'tool_use' || typeof block.id !== 'string') continue;
+        const name = typeof block.name === 'string' ? block.name : '';
+        pending.set(block.id, { id: block.id, name, at });
+        if (name === 'ScheduleWakeup') {
+          const input = (block.input ?? {}) as Record<string, unknown>;
+          const delay = Number(input.delaySeconds);
+          if (input.stop === true) scheduledWakeAt = null;
+          else if (at !== null && Number.isFinite(delay)) scheduledWakeAt = at + Math.min(3600, Math.max(60, delay)) * 1000;
+        }
+      }
+    } else if (entry.type === 'user') {
+      for (const block of blocksOf(entry)) {
+        if (block.type === 'tool_result' && typeof block.tool_use_id === 'string') pending.delete(block.tool_use_id);
+      }
+    }
+    if (endsTurn(entry)) pending.clear(); // calls left from an interrupted turn no longer matter
+  }
+  return { state: classifyTranscriptLines(lines), pendingTools: [...pending.values()], scheduledWakeAt };
 }
 
 async function readTail(file: string, size: number, maxBytes: number): Promise<string[]> {
@@ -72,26 +132,31 @@ async function readTail(file: string, size: number, maxBytes: number): Promise<s
   }
 }
 
-export async function readTranscriptState(file: string, size: number): Promise<TranscriptState> {
+export async function readTranscriptInfo(file: string, size: number): Promise<TranscriptInfo> {
+  let info: TranscriptInfo = { state: 'unknown', pendingTools: [], scheduledWakeAt: null };
   // Tool results can make single lines huge, so widen the window once if needed.
   for (const window of [256 * 1024, 4 * 1024 * 1024]) {
-    const state = classifyTranscriptLines(await readTail(file, size, window));
-    if (state !== 'unknown' || size <= window) return state;
+    info = analyzeTranscriptLines(await readTail(file, size, window));
+    if (info.state !== 'unknown' || size <= window) break;
   }
-  return 'unknown';
+  return info;
 }
 
-/** Caches transcript states by file size and modification time. */
-export class TranscriptStateCache {
-  private readonly entries = new Map<string, { mtimeMs: number; size: number; state: TranscriptState }>();
+export async function readTranscriptState(file: string, size: number): Promise<TranscriptState> {
+  return (await readTranscriptInfo(file, size)).state;
+}
 
-  async get(file: string, mtimeMs: number, size: number): Promise<TranscriptState> {
+/** Caches transcript analysis by file size and modification time. */
+export class TranscriptInfoCache {
+  private readonly entries = new Map<string, { mtimeMs: number; size: number; info: TranscriptInfo }>();
+
+  async get(file: string, mtimeMs: number, size: number): Promise<TranscriptInfo> {
     const hit = this.entries.get(file);
-    if (hit && hit.mtimeMs === mtimeMs && hit.size === size) return hit.state;
-    const state = await readTranscriptState(file, size);
-    if (this.entries.size > 500) this.entries.clear();
-    this.entries.set(file, { mtimeMs, size, state });
-    return state;
+    if (hit && hit.mtimeMs === mtimeMs && hit.size === size) return hit.info;
+    const info = await readTranscriptInfo(file, size);
+    if (this.entries.size > 1000) this.entries.clear();
+    this.entries.set(file, { mtimeMs, size, info });
+    return info;
   }
 }
 

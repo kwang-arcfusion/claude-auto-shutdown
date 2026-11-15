@@ -1,15 +1,24 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { CpuSampler, parseSnapshotJson, procKey, type ProcInfo } from '../src/main/detector/processes';
-import { classifyDescendants, filetimeToMs, indexProcesses, isToolProcess, processMatchesSession } from '../src/main/detector/tree';
+import { ActivitySampler, parseSnapshotJson, procKey, type ProcInfo } from '../src/main/detector/processes';
+import {
+  classifyDescendants,
+  filetimeToMs,
+  indexProcesses,
+  isToolProcess,
+  msToFiletime,
+  processMatchesSession,
+  sleepEndsAt,
+} from '../src/main/detector/tree';
 
-const P = (pid: number, ppid: number, name: string, cmd = '', created = 1000 + pid, cpuTicks = 0): ProcInfo => ({
+const P = (pid: number, ppid: number, name: string, cmd = '', created = 1000 + pid, cpuTicks = 0, ioBytes = 0): ProcInfo => ({
   pid,
   ppid,
   name,
   cmd,
   created,
   cpuTicks,
+  ioBytes,
 });
 
 // Command lines as seen on Windows with Claude Code 2.1.325 (shortened).
@@ -60,21 +69,32 @@ test('processMatchesSession compares procStart with the creation time', () => {
 
 test('processMatchesSession falls back to startedAt: the process must not start after the session', () => {
   const startedAt = 1_794_723_026_534;
-  const toFiletime = (ms: number): number => (ms + 11_644_473_600_000) * 10_000;
   // The desktop app keeps spare processes, so a process 6 minutes older than the session is normal.
-  assert.equal(processMatchesSession({ startedAt }, P(1, 0, 'claude.exe', '', toFiletime(startedAt - 349_294))), true);
-  assert.equal(processMatchesSession({ startedAt }, P(1, 0, 'claude.exe', '', toFiletime(startedAt + 60_000))), false);
+  assert.equal(processMatchesSession({ startedAt }, P(1, 0, 'claude.exe', '', msToFiletime(startedAt - 349_294))), true);
+  assert.equal(processMatchesSession({ startedAt }, P(1, 0, 'claude.exe', '', msToFiletime(startedAt + 60_000))), false);
 });
 
-test('filetimeToMs converts a FILETIME to Unix milliseconds', () => {
+test('FILETIME conversions', () => {
   assert.equal(Math.round(filetimeToMs(Number('134391962772404597'))), 1_794_722_677_240);
+  assert.equal(filetimeToMs(msToFiletime(1_800_000_000_000)), 1_800_000_000_000);
 });
 
-test('parseSnapshotJson accepts an array or a single object and skips pid 0', () => {
+test('sleepEndsAt understands timed waits, and nothing else', () => {
+  const start = 1_800_000_000_000;
+  const at = (name: string, cmd: string): number | null => sleepEndsAt(P(1, 0, name, cmd, msToFiletime(start)));
+  assert.equal(at('sleep.exe', 'C:\\Program Files\\Git\\usr\\bin\\sleep.exe 3600'), start + 3_600_000);
+  assert.equal(at('sleep.exe', 'sleep 5m'), start + 300_000);
+  assert.equal(at('sleep.exe', '"C:\\Program Files\\Git\\usr\\bin\\sleep.exe" 1.5h'), start + 5_400_000);
+  assert.equal(at('timeout.exe', 'timeout /t 90 /nobreak'), start + 90_000);
+  assert.equal(at('sleep.exe', 'sleep infinity'), null);
+  assert.equal(at('node.exe', 'node sleep 3600'), null);
+});
+
+test('parseSnapshotJson accepts an array or a single object, reads I/O and skips pid 0', () => {
   const json = JSON.stringify([
-    { p: 0, pp: 0, n: 'System Idle Process', c: '0', t: '0', cmd: '' },
-    { p: 4, pp: 0, n: 'System', c: '0', t: '123', cmd: null },
-    { p: 28348, pp: 22772, n: 'claude.exe', c: '134391962772404597', t: '50000000', cmd: 'claude.exe --output-format stream-json' },
+    { p: 0, pp: 0, n: 'System Idle Process', c: '0', t: '0', io: '0', cmd: '' },
+    { p: 4, pp: 0, n: 'System', c: '0', t: '123', io: '99', cmd: null },
+    { p: 28348, pp: 22772, n: 'claude.exe', c: '134391962772404597', t: '50000000', io: '2048', cmd: 'claude.exe --output-format stream-json' },
   ]);
   const procs = parseSnapshotJson(json);
   assert.deepEqual(
@@ -82,27 +102,30 @@ test('parseSnapshotJson accepts an array or a single object and skips pid 0', ()
     [4, 28348],
   );
   assert.equal(procs[1]!.cpuTicks, 50_000_000);
+  assert.equal(procs[1]!.ioBytes, 2048);
   assert.equal(procs[0]!.cmd, '');
   const single = parseSnapshotJson(`\uFEFF${JSON.stringify({ p: 9, pp: 1, n: 'x.exe', c: '1', t: '2', cmd: 'x' })}`);
   assert.equal(single[0]!.pid, 9);
+  assert.equal(single[0]!.ioBytes, 0);
 });
 
-test('CpuSampler reports % of one core between snapshots', () => {
-  const sampler = new CpuSampler();
-  const a = P(1, 0, 'a.exe', '', 10, 0);
-  const b = P(2, 0, 'b.exe', '', 20, 0);
+test('ActivitySampler reports CPU (% of one core) and I/O rates between snapshots', () => {
+  const sampler = new ActivitySampler();
+  const a = P(1, 0, 'a.exe', '', 10, 0, 0);
+  const b = P(2, 0, 'b.exe', '', 20, 0, 1_000);
   assert.equal(sampler.update({ at: 1_000, procs: [a, b] }, 60_000), null);
-  // 2 s later: a used 1 s of CPU (50 %), b used none, c started in between and used 0.2 s (10 %).
-  const c = P(3, 0, 'c.exe', '', 30, 2_000_000);
-  const usage = sampler.update({ at: 3_000, procs: [{ ...a, cpuTicks: 10_000_000 }, b, c] }, 60_000);
+  // 2 s later: a used 1 s of CPU (50 %); b moved 4 KB (2 KB/s); c started in between with 0.2 s of CPU.
+  const c = P(3, 0, 'c.exe', '', 30, 2_000_000, 0);
+  const usage = sampler.update({ at: 3_000, procs: [{ ...a, cpuTicks: 10_000_000 }, { ...b, ioBytes: 5_096 }, c] }, 60_000);
   assert.ok(usage);
-  assert.equal(Math.round(usage.get(procKey(a))!), 50);
-  assert.equal(usage.get(procKey(b)), 0);
-  assert.equal(Math.round(usage.get(procKey(c))!), 10);
+  assert.equal(Math.round(usage.get(procKey(a))!.cpuPercent), 50);
+  assert.equal(usage.get(procKey(b))!.cpuPercent, 0);
+  assert.equal(usage.get(procKey(b))!.ioBytesPerSec, 2_048);
+  assert.equal(Math.round(usage.get(procKey(c))!.cpuPercent), 10);
 });
 
-test('CpuSampler does not compare with a snapshot that is too old', () => {
-  const sampler = new CpuSampler();
+test('ActivitySampler does not compare with a snapshot that is too old', () => {
+  const sampler = new ActivitySampler();
   sampler.update({ at: 0, procs: [] }, 1_000);
   assert.equal(sampler.update({ at: 5_000, procs: [] }, 1_000), null);
 });

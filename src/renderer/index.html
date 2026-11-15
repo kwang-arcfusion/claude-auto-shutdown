@@ -60,8 +60,16 @@
             <span>นับถอยหลัง</span>
             <span class="num"><input type="number" name="countdownMinutes" min="0" max="720" step="any" /><em>นาที</em></span>
           </label>
-          <label class="row" title="session ที่สถานะ busy แต่เงียบนานเท่านี้ (เช่น ติดหน้าขออนุญาต) จะนับว่าเสร็จ · 0 = ไม่ใช้">
-            <span>นับว่าค้างหลัง</span>
+          <label class="row" title="Claude ขออนุญาตหรือถามคำถาม แล้วไม่มีคนตอบนานเท่านี้ จะนับว่าเสร็จ · 0 = ไม่ใช้">
+            <span>รอคำตอบนานสุด</span>
+            <span class="num"><input type="number" name="waitingMinutes" min="0" max="720" step="any" /><em>นาที</em></span>
+          </label>
+          <label class="row" title="คำสั่งเบื้องหลังที่ยังเปิดอยู่ แต่ไม่ใช้ CPU ไม่อ่าน/เขียนไฟล์ และไม่มี output นานเท่านี้ จะนับว่าค้าง · 0 = ไม่ใช้">
+            <span>background ค้างนานสุด</span>
+            <span class="num"><input type="number" name="toolStallMinutes" min="0" max="1440" step="any" /><em>นาที</em></span>
+          </label>
+          <label class="row" title="session ที่ขึ้นว่าทำงานแต่ไม่มีความเคลื่อนไหวเลยนานเท่านี้ จะนับว่าเสร็จ · 0 = ไม่ใช้">
+            <span>เงียบนานสุด</span>
             <span class="num"><input type="number" name="stalledMinutes" min="0" max="1440" step="any" /><em>นาที</em></span>
           </label>
           <label class="row">
