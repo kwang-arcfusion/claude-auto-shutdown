@@ -33,12 +33,12 @@ With the setting off, closing the window quits the app, unless it is watching. W
 - Work detached from Claude (`nohup ... &`, `Start-Process`, `docker run -d`) runs outside the session's process tree, so the app cannot see it.
 - If Claude runs as administrator but this app does not, command lines may be unreadable. The app then relies on the `shell` status and process creation times.
 - Claude in WSL, or with another `CLAUDE_CONFIG_DIR`, is not seen. You can point "Claude folder" in Settings at one folder at a time.
-- The app reads Claude Code's internal file formats. After a Claude update, run `npm run detect -- --full` to check they can still be read.
+- The app reads Claude Code's internal file formats, which can change in an update. It watches for that by itself: a session status it does not know, or a transcript still mid-turn with no status file, keeps the PC on and shows a warning in the window and the log. `npm run detect -- --full` shows everything the detector sees.
 - While watching, the app keeps Windows from sleeping (the screen can still turn off). Closing the lid or pressing the power button still puts the PC to sleep.
 
 ## Log
 
-The log is stored in SQLite at `%APPDATA%\Claude Auto Shutdown\logs.sqlite` and kept for 30 days. Older entries are deleted when the app starts and every hour after that.
+The log is stored in SQLite at `%APPDATA%\Claude Auto Shutdown\logs.sqlite` and kept for 7 days. Older entries are deleted when the app starts and every hour after that.
 
 The table is `events`, with the columns `id, at, level, message, code, params`. `code` and `params` let the window show each entry in the selected language. `message` holds an English copy for reading the file directly.
 

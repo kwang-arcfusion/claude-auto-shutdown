@@ -468,7 +468,7 @@ function main(): void {
       if (!START_HIDDEN) mainWindow = createWindow();
 
       setInterval(() => controller.tick(), 1000);
-      setInterval(() => logs.store?.prune(), 60 * 60 * 1000); // keep only the last 30 days
+      setInterval(() => logs.store?.prune(), 60 * 60 * 1000); // keep only the last 7 days
       powerMonitor.on('suspend', () => controller.addLog('info', 'app.suspending'));
       powerMonitor.on('resume', () => {
         controller.onResume();

@@ -113,6 +113,9 @@ const CHILD_TIME_SLACK_MS = 2_000;
 /** Helper CPU can stretch the silence rule of a busy turn, but only this far. */
 export const HELPER_EXTENSION_MAX_MS = 3 * 60 * MIN;
 
+/** The statuses Claude Code writes (verified on 2.1.325). Anything else means its format changed. */
+export const KNOWN_STATUSES: ReadonlySet<string> = new Set(['busy', 'idle', 'shell']);
+
 /** Tools that always wait for the user (value: what they wait for, a "what.<value>" text). */
 const QUESTION_TOOLS: Record<string, string> = { AskUserQuestion: 'question', ExitPlanMode: 'plan' };
 /** Tools that start a shell once allowed: no shell after the grace period = permission prompt. */
@@ -184,6 +187,13 @@ export function evaluateSession(input: EvaluateInput): Evaluation {
 
   const toolStallMs = settings.toolStallMinutes * MIN;
   const stalledMs = settings.stalledMinutes * MIN;
+
+  // 0. A status this app does not know (Claude Code updated?) never counts as finished. After a
+  // long silence, a process check still drops a file left behind by a process that has exited.
+  if (file.status !== undefined && !KNOWN_STATUSES.has(file.status)) {
+    const needsCheck = processes === null && stalledMs > 0 && quietMs >= stalledMs;
+    return result('working', true, msg('reason.unknownStatus', { status: file.status }), needsCheck);
+  }
 
   // 1. Commands Claude started, including background tasks: wait while they show any activity.
   let hung: ProcInfo[] = [];

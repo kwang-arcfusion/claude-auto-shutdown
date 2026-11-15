@@ -392,3 +392,41 @@ test('a scheduled wake-up keeps an idle session on until it is due', async () =>
   state.clock = START + 36 * MIN; // due at +30 min, plus 5 min grace
   assert.equal((await d.detect(settings)).aggregate, 'idle');
 });
+
+// ---- formats this app does not know (Claude Code updated?) ------------------------------
+
+test('an unknown session status keeps the PC on and says why', async () => {
+  const dir = claudeDir([{ pid: 11, sessionId: 'a', status: 'thinking', procStart: '5000', statusUpdatedAt: Date.now() }]);
+  const r = await detector(dir, new FakeSnapshotter(() => [claudeProc(11)]), [11]).detect(settings);
+  assert.equal(r.aggregate, 'busy');
+  assert.equal(r.sessions[0]!.reason.code, 'reason.unknownStatus');
+  assert.equal(r.error?.code, 'error.unknownStatus');
+  assert.match(render('en', r.error!), /Unknown session status "thinking": not shutting down/);
+});
+
+test('no session file, but a transcript still mid-turn: never idle (status files may have moved)', async () => {
+  const running = JSON.stringify({ type: 'assistant', message: { stop_reason: 'tool_use', content: [] } });
+  const ended = JSON.stringify({ type: 'assistant', message: { stop_reason: 'end_turn', content: [] } });
+  const snapshotter = new FakeSnapshotter(() => []);
+
+  const working = claudeDir([], { '1234abcd-0000': [ended, running] });
+  const r = await detector(working, snapshotter, []).detect(settings);
+  assert.equal(r.aggregate, 'unknown');
+  assert.equal(r.error?.code, 'error.noStatusFile');
+  assert.match(render('en', r.error!), /Session 1234abcd is mid-turn but has no status file/);
+
+  // A finished transcript, or one mid-turn but silent for longer than "max silence": no sessions.
+  assert.equal((await detector(claudeDir([], { s: [running, ended] }), snapshotter, []).detect(settings)).aggregate, 'idle');
+  const old = claudeDir([], { s: [running] });
+  const oldFile = path.join(old, 'projects', 'C--work-app', 's.jsonl');
+  const longAgo = (Date.now() - 50 * MIN) / 1000;
+  utimesSync(oldFile, longAgo, longAgo);
+  assert.equal((await detector(old, snapshotter, []).detect(settings)).aggregate, 'idle');
+
+  // A crashed session leaves its file behind: that explains its transcript, so it is not a sign.
+  const crashed = claudeDir([{ pid: 12, sessionId: 'crashed', status: 'busy', procStart: '5000' }], { crashed: [running] });
+  assert.equal((await detector(crashed, snapshotter, []).detect(settings)).aggregate, 'idle');
+
+  // Display-only checks (not watching) skip the scan.
+  assert.equal((await detector(working, snapshotter, []).detect(settings, { skipProcesses: true })).aggregate, 'idle');
+});

@@ -269,3 +269,22 @@ test('helper CPU keeps a finished turn on only for toolStallMinutes, and a silen
   assert.equal(evaluateSession(input({ status: 'busy' }, { lastActivityAt: NOW - 2 * 60 * MIN, processes: busyHelpers })).blocksShutdown, true);
   assert.equal(evaluateSession(input({ status: 'busy' }, { lastActivityAt: NOW - 4 * 60 * MIN, processes: busyHelpers })).verdict, 'stalled');
 });
+
+// ---- formats this app does not know (Claude Code updated?) ------------------------------
+
+test('a status this app does not know counts as working, never as finished', () => {
+  const r = evaluateSession(input({ status: 'thinking' }, { lastActivityAt: NOW - 10 * MIN }));
+  assert.equal(r.verdict, 'working');
+  assert.equal(r.blocksShutdown, true);
+  assert.equal(r.reason.code, 'reason.unknownStatus');
+  assert.equal(text(r.reason), 'Unknown status "thinking", counted as working');
+
+  // Even after a long silence it keeps the PC on; without processes it asks for a check, which
+  // can still drop a file left behind by a process that has exited.
+  const quiet = evaluateSession(input({ status: 'thinking' }, { lastActivityAt: NOW - 3 * 60 * MIN, processes: null }));
+  assert.equal(quiet.blocksShutdown, true);
+  assert.equal(quiet.needsProcessCheck, true);
+  const checked = evaluateSession(input({ status: 'thinking' }, { lastActivityAt: NOW - 3 * 60 * MIN }));
+  assert.equal(checked.blocksShutdown, true);
+  assert.equal(checked.needsProcessCheck, false);
+});

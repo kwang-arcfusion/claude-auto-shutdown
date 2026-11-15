@@ -4,7 +4,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { test } from 'node:test';
 import { DatabaseSync } from 'node:sqlite';
-import { LogStore } from '../src/main/log-store';
+import { LOG_RETENTION_DAYS, LogStore } from '../src/main/log-store';
 
 const DAY = 24 * 60 * 60 * 1000;
 const tempDb = (): string => path.join(mkdtempSync(path.join(os.tmpdir(), 'cas-logs-')), 'logs.sqlite');
@@ -69,5 +69,19 @@ test('a log from an older version (no code columns) is upgraded and keeps its en
   assert.equal(coded!.code, 'log.actionSent');
   assert.deepEqual(coded!.params, { command: 'shutdown /s /t 0' });
   assert.equal(coded!.message, 'Sent shutdown /s /t 0'); // English copy for reading the file directly
+  store.close();
+});
+
+test('the log keeps 7 days by default', () => {
+  assert.equal(LOG_RETENTION_DAYS, 7);
+  const now = 1_800_000_000_000;
+  const store = new LogStore(tempDb(), undefined, () => now);
+  store.append({ at: now - 8 * DAY, level: 'info', message: 'last week' });
+  store.append({ at: now - 6 * DAY, level: 'info', message: 'this week' });
+  assert.equal(store.prune(), 1);
+  assert.deepEqual(
+    store.recent(10).map((e) => e.message),
+    ['this week'],
+  );
   store.close();
 });

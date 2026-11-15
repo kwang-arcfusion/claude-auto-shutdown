@@ -4,7 +4,7 @@ import { DatabaseSync, type StatementSync } from 'node:sqlite';
 import { renderEntry, type MessageParams } from '../shared/i18n';
 import type { LogEntry, LogLevel } from '../shared/types';
 
-export const LOG_RETENTION_DAYS = 30;
+export const LOG_RETENTION_DAYS = 7;
 const DAY_MS = 24 * 60 * 60 * 1000;
 const LEVELS: readonly LogLevel[] = ['info', 'warn', 'error'];
 

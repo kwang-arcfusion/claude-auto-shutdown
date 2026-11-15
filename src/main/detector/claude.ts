@@ -6,6 +6,7 @@ import type { Aggregate, DetectionResult, SessionInfo, Settings } from '../../sh
 import { ActivitySampler, procKey, type ProcActivity, type ProcInfo, type ProcessSnapshot, type SnapshotSource } from './processes';
 import {
   evaluateSession,
+  KNOWN_STATUSES,
   maxOf,
   parseSessionFile,
   type Evaluation,
@@ -96,6 +97,12 @@ function aggregateOf(sessions: readonly SessionInfo[], error: Message | null): A
   return error ? 'unknown' : 'idle';
 }
 
+/** A sign that Claude Code's files changed format (after an update?): shown, logged, never idle. */
+function formatProblem(sessions: readonly SessionInfo[]): Message | null {
+  const unknown = sessions.find((s) => s.status !== null && !KNOWN_STATUSES.has(s.status));
+  return unknown ? msg('error.unknownStatus', { status: unknown.status! }) : null;
+}
+
 function sortSessions(sessions: SessionInfo[]): SessionInfo[] {
   return sessions.sort(
     (a, b) => Number(b.blocksShutdown) - Number(a.blocksShutdown) || (b.lastActivityAt ?? 0) - (a.lastActivityAt ?? 0),
@@ -159,9 +166,22 @@ export class ClaudeDetector implements Detector {
 
     const { files, unreadableLive } = await this.loadSessionFiles(sessionsDir, names);
     const fileError = unreadableLive > 0 ? msg('error.unreadableSessionFiles', { count: unreadableLive }) : null;
+    const report = (sessions: SessionInfo[], usedProcessSnapshot: boolean): DetectionResult => {
+      const error = fileError ?? formatProblem(sessions);
+      return finish(aggregateOf(sessions, error), sessions, error, usedProcessSnapshot);
+    };
     const live = files.filter((f) => this.pidAlive(f.pid));
     const now = this.now();
     const projectsDir = path.join(claudeDir, 'projects');
+
+    // No session is open. Before calling that idle, make sure Claude has not just stopped writing
+    // status files (after an update): a transcript still mid-turn means it is working.
+    if (live.length === 0 && (!detectOptions.skipProcesses || detectOptions.forceSnapshot)) {
+      // A file left behind by a crashed session explains its own transcript; only sessions with
+      // no file at all count.
+      const orphan = await this.transcriptWithoutSession(projectsDir, now, settings, new Set(files.map((f) => f.sessionId)));
+      if (orphan !== null) return finish('unknown', [], fileError ?? msg('error.noStatusFile', { session: orphan.slice(0, 8) }), false);
+    }
     const activity = await Promise.all(live.map((f) => this.activityFor(projectsDir, f, now, settings)));
 
     // Cheap pass from files only: one clearly busy session is enough to keep the machine on.
@@ -169,14 +189,10 @@ export class ClaudeDetector implements Detector {
     const clearlyBusy = cheap.some((e) => e.blocksShutdown && !e.needsProcessCheck);
     const cheapInfos = (): SessionInfo[] => live.map((f, i) => toInfo(f, activity[i]!, cheap[i]!, null));
 
-    if (!detectOptions.forceSnapshot && (clearlyBusy || live.length === 0)) {
-      const sessions = cheapInfos();
-      return finish(aggregateOf(sessions, fileError), sessions, fileError, false);
-    }
+    if (!detectOptions.forceSnapshot && (clearlyBusy || live.length === 0)) return report(cheapInfos(), false);
     if (detectOptions.skipProcesses && !detectOptions.forceSnapshot) {
       // Display-only check: no PowerShell, so an idle verdict here is unverified.
-      const sessions = cheapInfos();
-      return { ...finish(aggregateOf(sessions, fileError), sessions, fileError, false), partial: true };
+      return { ...report(cheapInfos(), false), partial: true };
     }
 
     const maxAgeMs = Math.max(3 * settings.pollIntervalSec * 1000, 120_000);
@@ -230,7 +246,7 @@ export class ClaudeDetector implements Detector {
       sessions.push(toInfo(file, activity[i]!, evaluation, processes));
     }
     for (const key of this.toolWatch.keys()) if (!watched.has(key)) this.toolWatch.delete(key);
-    return finish(aggregateOf(sessions, fileError), sessions, fileError, true);
+    return report(sessions, true);
   }
 
   private async loadSessionFiles(dir: string, names: readonly string[]): Promise<{ files: SessionFile[]; unreadableLive: number }> {
@@ -327,6 +343,60 @@ export class ClaudeDetector implements Detector {
       if (info.state === 'running') return { latest, runningSubagentAt: s.mtimeMs };
     }
     return { latest, runningSubagentAt: null };
+  }
+
+  /**
+   * Called when no session file belongs to a running process. A transcript that was written
+   * recently, is still mid-turn and has no session file (`known`) means Claude is working
+   * without a status file (its format may have changed in an update). Returns that
+   * transcript's session id. Spare Claude Code processes the desktop app keeps ready write no
+   * transcript, so they never trigger this.
+   */
+  private async transcriptWithoutSession(
+    projectsDir: string,
+    now: number,
+    settings: Settings,
+    known: ReadonlySet<string>,
+  ): Promise<string | null> {
+    const windowMs = settings.stalledMinutes > 0 ? settings.stalledMinutes * 60_000 : SUBAGENT_LOOKBACK_MS;
+    let projects;
+    try {
+      projects = await readdir(projectsDir, { withFileTypes: true });
+    } catch {
+      return null;
+    }
+    for (const project of projects) {
+      if (!project.isDirectory()) continue;
+      const dir = path.join(projectsDir, project.name);
+      let names: string[];
+      try {
+        names = (await readdir(dir, { withFileTypes: true }))
+          .filter((e) => e.isFile() && e.name.endsWith('.jsonl') && !known.has(e.name.slice(0, -'.jsonl'.length)))
+          .map((e) => e.name);
+      } catch {
+        continue;
+      }
+      const recent = await Promise.all(
+        names.map(async (name) => {
+          try {
+            const stats = await stat(path.join(dir, name));
+            return now - stats.mtimeMs < windowMs ? { name, mtimeMs: stats.mtimeMs, size: stats.size } : null;
+          } catch {
+            return null; // removed meanwhile
+          }
+        }),
+      );
+      for (const file of recent) {
+        if (!file) continue;
+        try {
+          const info = await this.transcripts.get(path.join(dir, file.name), file.mtimeMs, file.size);
+          if (info.state === 'running') return file.name.slice(0, -'.jsonl'.length);
+        } catch {
+          // removed meanwhile
+        }
+      }
+    }
+    return null;
   }
 
   /**
