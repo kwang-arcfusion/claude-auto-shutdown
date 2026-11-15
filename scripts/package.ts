@@ -1,18 +1,11 @@
 // Builds a portable Windows app folder: release/Claude Auto Shutdown-win32-x64/
-// Run with: npm run package
-import { mkdirSync, writeFileSync } from 'node:fs';
+// Run with: npm run package   (then `npm run shortcut` for a Desktop shortcut)
 import path from 'node:path';
-import { encodeIco, renderPowerIcon } from '../src/main/icon';
 
 void (async () => {
   const root = path.resolve(__dirname, '..');
   const pkg = require('../package.json') as { version: string; productName: string };
-
-  const buildDir = path.join(root, 'build');
-  mkdirSync(buildDir, { recursive: true });
-  const icon = path.join(buildDir, 'icon.ico');
-  const sizes = [16, 24, 32, 48, 64, 128, 256];
-  writeFileSync(icon, encodeIco(sizes.map((size) => ({ size, png: renderPowerIcon(size, [34, 160, 107]) }))));
+  const icon = path.join(root, 'assets', 'icon.ico'); // written by `npm run build` (scripts/icons.ts)
 
   const { packager } = await import('@electron/packager');
   const outputs = await packager({
@@ -27,11 +20,12 @@ void (async () => {
     icon,
     appVersion: pkg.version,
     ignore: [
-      // Everything the app needs is bundled into dist/, so no node_modules at all.
+      // Everything the app needs is bundled into dist/ (icons included), so nothing else ships.
       /^\/node_modules($|\/)/,
       /^\/src($|\/)/,
       /^\/test($|\/)/,
       /^\/scripts($|\/)/,
+      /^\/assets($|\/)/,
       /^\/build($|\/)/,
       /^\/release($|\/)/,
       /^\/tsconfig\.json$/,

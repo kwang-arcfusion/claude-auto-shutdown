@@ -45,7 +45,7 @@ export class Controller {
   private nextPollAt: number | null = null;
   private log: LogEntry[] = [];
   private inFlight: Promise<DetectionResult> | null = null;
-  private finalChecking = false;
+  private finalCheckRunning: Promise<void> | null = null;
   private finalCheckFailures = 0;
 
   constructor(
@@ -146,7 +146,16 @@ export class Controller {
         return;
       }
     }
-    if (now >= this.countdownEndsAt) void this.finalCheck();
+    if (now >= this.countdownEndsAt && !this.finalCheckRunning) {
+      this.finalCheckRunning = this.finalCheck().finally(() => {
+        this.finalCheckRunning = null;
+      });
+    }
+  }
+
+  /** Resolves once a final check started by tick() (if any) has finished. */
+  settled(): Promise<void> {
+    return this.finalCheckRunning ?? Promise.resolve();
   }
 
   /** The machine woke from sleep or hibernation. */
@@ -267,8 +276,6 @@ export class Controller {
   }
 
   private async finalCheck(): Promise<void> {
-    if (this.finalChecking) return;
-    this.finalChecking = true;
     try {
       const result = await this.detect();
       this.recordDetection(result);
@@ -287,7 +294,6 @@ export class Controller {
         }
       }
     } finally {
-      this.finalChecking = false;
       this.deps.onChange();
     }
   }

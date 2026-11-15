@@ -4,7 +4,7 @@
 
 ## ใช้งาน
 
-1. เปิด `release\Claude Auto Shutdown-win32-x64\Claude Auto Shutdown.exe`
+1. ดับเบิลคลิก **Claude Auto Shutdown** บน Desktop (หรือเปิด `release\Claude Auto Shutdown-win32-x64\Claude Auto Shutdown.exe`)
 2. กด **เริ่มเฝ้า** ก่อนนอน แล้วปล่อยแอปไว้ (ปิดหน้าต่างได้ แอปจะไปอยู่ใน tray)
 3. เมื่อ Claude ว่างต่อเนื่อง 10 นาที แอปจะนับถอยหลัง 20 นาที ตรวจซ้ำอีกรอบ แล้วสั่ง `shutdown /s /f /t 0`
 
@@ -28,10 +28,13 @@ npm install
 node node_modules/electron/install.js   # Electron 45 ไม่ดาวน์โหลด binary ตอน npm install
 npm start            # รันแอป
 npm run start:dry    # รันแบบโหมดทดสอบ (ไม่ปิดเครื่องจริง)
-npm test             # unit test
+npm test             # unit test + จำลองทั้งคืนแบบเร่งเวลา
 npm run e2e          # ทดสอบแอปจริงครบรอบแบบ dry-run
 npm run detect       # ดูว่าตัวตรวจเห็นอะไรตอนนี้ (--full = ตรวจ process ด้วย)
 npm run package      # สร้างโฟลเดอร์ .exe ใน release/
+npm run shortcut     # สร้าง shortcut บน Desktop (หลัง package)
 ```
+
+Icon: `assets/icon.svg` ใช้เป็น favicon ส่วน `.ico`/`.png` สร้างจากรูปทรงเดียวกันใน `src/main/icon.ts` ทุกครั้งที่ `npm run build`
 
 Flag ของแอป: `--dry-run` (บังคับโหมดทดสอบ), `--hidden` (เริ่มแบบซ่อนใน tray)

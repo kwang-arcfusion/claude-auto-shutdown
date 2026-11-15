@@ -6,14 +6,16 @@
   "description": "Shuts Windows down automatically after Claude Code sessions finish.",
   "main": "dist/main.js",
   "scripts": {
-    "build": "node scripts/build.mjs",
+    "icons": "tsx scripts/icons.ts",
+    "build": "tsx scripts/icons.ts && node scripts/build.mjs",
     "typecheck": "tsc -p tsconfig.json",
     "test": "node --import tsx --test \"test/**/*.test.ts\"",
     "start": "npm run build && electron .",
     "start:dry": "npm run build && electron . --dry-run",
     "detect": "tsx scripts/detect.ts",
     "e2e": "npm run build && tsx scripts/e2e.ts",
-    "package": "npm run build && tsx scripts/package.ts"
+    "package": "npm run build && tsx scripts/package.ts",
+    "shortcut": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/create-shortcut.ps1"
   },
   "devDependencies": {
     "@electron/packager": "20.3.0",

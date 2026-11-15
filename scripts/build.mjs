@@ -38,4 +38,7 @@ await Promise.all([
 
 await cp('src/renderer/index.html', 'dist/renderer/index.html');
 await cp('src/renderer/styles.css', 'dist/renderer/styles.css');
+// Icons are generated into assets/ by scripts/icons.ts (run first by `npm run build`).
+await cp('assets/icon.svg', 'dist/renderer/icon.svg');
+await cp('assets/icon.ico', 'dist/icon.ico');
 console.log('built dist/');

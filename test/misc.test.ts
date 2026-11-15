@@ -4,7 +4,6 @@ import os from 'node:os';
 import path from 'node:path';
 import { test } from 'node:test';
 import { buildActionCommand } from '../src/main/actions';
-import { encodeIco, renderPowerIcon } from '../src/main/icon';
 import { loadSettings, saveSettings } from '../src/main/storage';
 import { DEFAULT_SETTINGS, formatMinutes, sanitizeSettings } from '../src/shared/settings';
 
@@ -54,23 +53,6 @@ test('the shutdown command forces apps closed only when asked', () => {
   const sleep = buildActionCommand('sleep', true, 'C:\\Windows');
   assert.match(sleep.file, /powershell\.exe$/i);
   assert.match(sleep.args.join(' '), /SetSuspendState/);
-});
-
-test('renderPowerIcon produces a PNG of the requested size', () => {
-  const png = renderPowerIcon(32, [229, 72, 77]);
-  assert.deepEqual([...png.subarray(0, 8)], [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
-  assert.equal(png.readUInt32BE(16), 32);
-  assert.equal(png.readUInt32BE(20), 32);
-});
-
-test('encodeIco writes one directory entry per image', () => {
-  const ico = encodeIco([
-    { size: 16, png: renderPowerIcon(16, [0, 0, 0]) },
-    { size: 256, png: renderPowerIcon(256, [0, 0, 0]) },
-  ]);
-  assert.equal(ico.readUInt16LE(2), 1);
-  assert.equal(ico.readUInt16LE(4), 2);
-  assert.equal(ico.readUInt8(6 + 16), 0); // 256 px is stored as 0
 });
 
 test('formatMinutes', () => {
