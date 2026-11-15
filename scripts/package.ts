@@ -34,6 +34,7 @@ void (async () => {
       /^\/tsconfig\.json$/,
       /^\/package-lock\.json$/,
       /^\/README\.md$/,
+      /^\/docs($|\/)/,
       /^\/\.gitignore$/,
       /\.map$/,
     ],

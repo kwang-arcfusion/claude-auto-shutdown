@@ -430,3 +430,67 @@ test('no session file, but a transcript still mid-turn: never idle (status files
   // Display-only checks (not watching) skip the scan.
   assert.equal((await detector(working, snapshotter, []).detect(settings, { skipProcesses: true })).aggregate, 'idle');
 });
+
+test('a busy session that moved into a worktree is judged by the transcript Claude writes now', async () => {
+  // Real case: status file cwd = worktree; the copy there stopped hours ago ("relocated"), while
+  // the live copy under the original folder is written every few seconds. Not "stuck".
+  const worktree = 'C:\work\app\.claude\worktrees\feature';
+  const dir = claudeDir([{ pid: 11, sessionId: 'w', status: 'busy', procStart: '5000', cwd: worktree, statusUpdatedAt: Date.now() - 4 * HOUR }]);
+  const old = path.join(dir, 'projects', 'C--work-app--claude-worktrees-feature');
+  mkdirSync(old, { recursive: true });
+  writeFileSync(path.join(old, 'w.jsonl'), `${JSON.stringify({ type: 'assistant', message: { stop_reason: 'end_turn', content: [] } })}\n${JSON.stringify({ type: 'relocated', relocatedCwd: worktree, sessionId: 'w' })}\n`);
+  const longAgo = (Date.now() - 4 * HOUR) / 1000;
+  utimesSync(path.join(old, 'w.jsonl'), longAgo, longAgo);
+  const live = path.join(dir, 'projects', 'C--work-app');
+  mkdirSync(live, { recursive: true });
+  writeFileSync(path.join(live, 'w.jsonl'), `${JSON.stringify({ type: 'assistant', message: { stop_reason: 'tool_use', content: [] } })}\n`);
+
+  const r = await detector(dir, new FakeSnapshotter(() => [claudeProc(11)]), [11]).detect(settings);
+  assert.equal(r.sessions[0]!.verdict, 'working');
+  assert.equal(r.sessions[0]!.transcriptState, 'running');
+  assert.equal(r.aggregate, 'busy');
+});
+
+test('background task output in any of the session\'s temp folders counts (one per project folder)', async () => {
+  const dir = claudeDir([{ pid: 11, sessionId: 'a', status: 'idle', procStart: '5000', statusUpdatedAt: START }]);
+  const temp = tempDir('cas-tmp-');
+  const stale = path.join(temp, '0000aaaa', 'a', 'tasks'); // listed first, quiet
+  const active = path.join(temp, 'ffff9999', 'a', 'tasks');
+  mkdirSync(stale, { recursive: true });
+  mkdirSync(active, { recursive: true });
+  writeFileSync(path.join(stale, 'old.output'), 'done\n');
+  utimesSync(path.join(stale, 'old.output'), new Date(START - HOUR), new Date(START - HOUR));
+  const output = path.join(active, 'b1.output');
+  writeFileSync(output, 'starting\n');
+  utimesSync(output, new Date(START), new Date(START));
+  const { state, d, pollFor } = clocked(dir, () => [claudeProc(11), child(21, 11, 'bash.exe', BASH_TOOL)], [11], temp);
+  assert.equal((await pollFor(21)).sessions[0]!.verdict, 'stalled');
+
+  state.clock += 30_000;
+  utimesSync(output, new Date(state.clock), new Date(state.clock));
+  assert.equal((await d.detect(settings)).sessions[0]!.verdict, 'tool');
+});
+
+test('a session that cannot be matched to its process also shows a warning', async () => {
+  const dir = claudeDir([{ pid: 11, sessionId: 'a', status: 'idle', procStart: '5000', statusUpdatedAt: Date.now() }]);
+  const r = await detector(dir, new FakeSnapshotter(() => [claudeProc(11, 99_000_000_000)]), [11]).detect(settings);
+  assert.equal(r.aggregate, 'busy');
+  assert.equal(r.error?.code, 'error.identityUnsure');
+  assert.match(render('en', r.error!), /Cannot match session 11 to its process/);
+});
+
+test('a process started after the turn ended (an async hook) is watched like a command', async () => {
+  const dir = claudeDir([{ pid: 11, sessionId: 'a', status: 'idle', procStart: '5000', statusUpdatedAt: START }]);
+  const hook = child(31, 11, 'node.exe', 'node hooks/wait-for-ci.js', msToFiletime(START + MIN));
+  const { pollFor } = clocked(dir, () => [claudeProc(11), hook], [11]);
+  assert.equal((await pollFor(10)).sessions[0]!.verdict, 'tool');
+  assert.equal((await pollFor(12)).sessions[0]!.verdict, 'stalled'); // quiet for 20 minutes: hung
+});
+
+test('time spent asleep is not silence: a quiet busy session just after waking is still working', async () => {
+  const dir = claudeDir([{ pid: 11, sessionId: 'a', status: 'busy', procStart: '5000', statusUpdatedAt: Date.now() - 3 * HOUR }]);
+  const d = detector(dir, new FakeSnapshotter(() => [claudeProc(11)]), [11]);
+  assert.equal((await d.detect(settings)).sessions[0]!.verdict, 'stalled');
+  assert.equal((await d.detect(settings, { activeSince: Date.now() - 5 * MIN })).sessions[0]!.verdict, 'working');
+});
+

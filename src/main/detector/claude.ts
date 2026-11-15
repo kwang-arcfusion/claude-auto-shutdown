@@ -14,8 +14,9 @@ import {
   type SessionActivity,
   type SessionFile,
 } from './session';
-import { latestMtimeUnder, TranscriptInfoCache, TranscriptLocator, type TranscriptInfo } from './transcript';
-import { classifyDescendants, indexProcesses, sessionIdentity, sleepEndsAt } from './tree';
+import { nextCronTime } from './cron';
+import { emptyTranscriptInfo, latestMtimeUnder, TranscriptInfoCache, TranscriptLocator, type CronJob, type TranscriptInfo } from './transcript';
+import { classifyDescendants, filetimeToMs, indexProcesses, sessionIdentity, sleepEndsAt } from './tree';
 
 /** Tool processes count as active at or above this CPU use (% of one core)... */
 const TOOL_ACTIVE_CPU_PERCENT = 2;
@@ -25,7 +26,20 @@ const TOOL_ACTIVE_IO_BYTES_PER_SEC = 1024;
 const SLEEP_GRACE_MS = 60_000;
 /** Subagent transcripts not written for this long are not read. */
 const SUBAGENT_LOOKBACK_MS = 6 * 60 * 60_000;
-const MISSING_RECHECK_MS = 5 * 60_000;
+/** Recurring CronCreate jobs expire this long after they were created (Claude Code 2.1.325: 7 days). */
+const CRON_MAX_AGE_MS = 7 * 24 * 60 * 60_000;
+/** A recurring job can fire up to 30 minutes late (Claude Code's jitter); plus 5 minutes of slack. */
+const CRON_RECURRING_GRACE_MS = 35 * 60_000;
+/** A one-shot job can fire 90 seconds late; plus slack. */
+const CRON_ONE_SHOT_GRACE_MS = 5 * 60_000;
+/** A job further ahead than this (tomorrow's reminder) is not tonight's work: it does not keep the PC on. */
+const CRON_MAX_AHEAD_MS = 6 * 60 * 60_000;
+/** Process creation times and file times come from different clocks. */
+const CLOCK_SLACK_MS = 2_000;
+/** How deep to look in a session's side folder (workflow agents sit three levels down). */
+const SIDE_FOLDER_DEPTH = 4;
+/** How often to look again for a session's temp folders (one per project folder it used). */
+const TEMP_RESCAN_MS = 5 * 60_000;
 
 export function defaultClaudeDir(env: NodeJS.ProcessEnv = process.env): string {
   const fromEnv = env.CLAUDE_CONFIG_DIR?.trim();
@@ -54,6 +68,11 @@ export interface DetectOptions {
   forceSnapshot?: boolean;
   /** Never inspect processes (display-only checks while disarmed): the result is marked partial. */
   skipProcesses?: boolean;
+  /**
+   * The PC woke up at this time: nothing counts as quiet before it, since time spent asleep is
+   * not silence (Claude was frozen too).
+   */
+  activeSince?: number;
 }
 
 export interface ClaudeDetectorOptions {
@@ -100,7 +119,15 @@ function aggregateOf(sessions: readonly SessionInfo[], error: Message | null): A
 /** A sign that Claude Code's files changed format (after an update?): shown, logged, never idle. */
 function formatProblem(sessions: readonly SessionInfo[]): Message | null {
   const unknown = sessions.find((s) => s.status !== null && !KNOWN_STATUSES.has(s.status));
-  return unknown ? msg('error.unknownStatus', { status: unknown.status! }) : null;
+  if (unknown) return msg('error.unknownStatus', { status: unknown.status! });
+  const unsure = sessions.find((s) => s.reason.code === 'reason.identityUnsure');
+  return unsure ? msg('error.identityUnsure', { pid: unsure.pid }) : null;
+}
+
+/** What a session scheduled for itself, remembered across checks (the transcript tail moves on). */
+interface Remembered {
+  timedWaitEndsAt: number | null;
+  crons: Map<string, CronJob>;
 }
 
 function sortSessions(sessions: SessionInfo[]): SessionInfo[] {
@@ -126,7 +153,8 @@ export class ClaudeDetector implements Detector {
   private readonly locator = new TranscriptLocator();
   private readonly transcripts = new TranscriptInfoCache();
   private readonly toolWatch = new Map<string, ToolWatch>();
-  private readonly tempDirs = new Map<string, { dir: string | null; checkedAt: number }>();
+  private readonly remembered = new Map<string, Remembered>();
+  private readonly tempDirs = new Map<string, { dirs: string[]; checkedAt: number }>();
   private readonly tempRoot: string;
   private readonly now: () => number;
   private readonly pidAlive: (pid: number) => boolean;
@@ -182,7 +210,7 @@ export class ClaudeDetector implements Detector {
       const orphan = await this.transcriptWithoutSession(projectsDir, now, settings, new Set(files.map((f) => f.sessionId)));
       if (orphan !== null) return finish('unknown', [], fileError ?? msg('error.noStatusFile', { session: orphan.slice(0, 8) }), false);
     }
-    const activity = await Promise.all(live.map((f) => this.activityFor(projectsDir, f, now, settings)));
+    const activity = await Promise.all(live.map((f) => this.activityFor(projectsDir, f, now, settings, detectOptions.activeSince)));
 
     // Cheap pass from files only: one clearly busy session is enough to keep the machine on.
     const cheap = live.map((file, i) => evaluateSession({ file, ...activity[i]!, processes: null, now, settings }));
@@ -224,7 +252,14 @@ export class ClaudeDetector implements Detector {
         sessions.push(toInfo(file, activity[i]!, unsure, null));
         continue;
       }
-      const { tools, helpers, newestCreatedAt } = classifyDescendants(index, proc);
+      const tree = classifyDescendants(index, proc);
+      const { newestCreatedAt } = tree;
+      // Processes started after the turn ended (an async hook, a job a background step left
+      // running) are work Claude may still wait for: watch them like commands it started.
+      const turnOverAt = file.status === 'idle' || file.status === 'shell' ? (file.statusUpdatedAt ?? null) : null;
+      const late = turnOverAt === null ? [] : tree.helpers.filter((p) => p.created > 0 && filetimeToMs(p.created) > turnOverAt + CLOCK_SLACK_MS);
+      const tools = late.length > 0 ? [...tree.tools, ...late] : tree.tools;
+      const helpers = late.length > 0 ? tree.helpers.filter((p) => !late.includes(p)) : tree.helpers;
       const rate = (p: ProcInfo): ProcActivity | undefined => usage?.get(procKey(p));
       const helperCpuPercent = usage ? helpers.reduce((sum, p) => sum + (rate(p)?.cpuPercent ?? 0), 0) : null;
       const helpersActiveNow = usage
@@ -235,11 +270,11 @@ export class ClaudeDetector implements Detector {
       let shellActiveAt: number | null = null;
       if (tools.length > 0) {
         watched.add(key);
-        toolsActiveAt = await this.toolsActiveAt(key, file.sessionId, tools, usage, checkedAt, maxAgeMs);
+        toolsActiveAt = await this.toolsActiveAt(key, file.sessionId, tools, usage, checkedAt, maxAgeMs, activity[i]!.timedWaitEndsAt ?? null);
       } else if (file.status === 'shell' && helpers.length > 0) {
         // Claude says a shell is running but none has a known marker: watch everything under it.
         watched.add(`${key}:shell`);
-        shellActiveAt = await this.toolsActiveAt(`${key}:shell`, file.sessionId, helpers, usage, checkedAt, maxAgeMs);
+        shellActiveAt = await this.toolsActiveAt(`${key}:shell`, file.sessionId, helpers, usage, checkedAt, maxAgeMs, activity[i]!.timedWaitEndsAt ?? null);
       }
       const processes: ProcessFacts = { tools, helperCpuPercent, toolsActiveAt, newestChildAt: newestCreatedAt, helpersActiveNow, shellActiveAt };
       const evaluation = evaluateSession({ file, ...activity[i]!, processes, now: checkedAt, settings });
@@ -269,20 +304,22 @@ export class ClaudeDetector implements Detector {
     return { files, unreadableLive };
   }
 
-  private async activityFor(projectsDir: string, file: SessionFile, now: number, settings: Settings): Promise<SessionActivity> {
-    const transcript = await this.locator.locate(projectsDir, file.sessionId, file.cwd, now);
-    let transcriptMtime: number | null = null;
-    let info: TranscriptInfo = { state: 'unknown', pendingTools: [], scheduledWakeAt: null };
+  private async activityFor(projectsDir: string, file: SessionFile, now: number, settings: Settings, activeSince?: number): Promise<SessionActivity> {
+    // A session that moved into a worktree can have copies in several project folders; the most
+    // recently written one is where Claude is writing now.
+    const copies = await this.locator.locateAll(projectsDir, file.sessionId, file.cwd, now);
+    const transcript = copies[0] ?? null;
+    let info: TranscriptInfo = emptyTranscriptInfo();
     if (transcript) {
       try {
-        const stats = await stat(transcript);
-        transcriptMtime = stats.mtimeMs;
-        info = await this.transcripts.get(transcript, stats.mtimeMs, stats.size);
+        info = await this.transcripts.get(transcript.file, transcript.mtimeMs, transcript.size);
       } catch {
-        // removed between locate and stat
+        // removed since it was found
       }
     }
-    const lastActivityAt = maxOf(transcriptMtime, file.statusUpdatedAt, file.updatedAt);
+    const lastActivityAt = maxOf(transcript?.mtimeMs, file.statusUpdatedAt, file.updatedAt, activeSince);
+    const memory = this.remember(file.sessionId, info);
+    const schedule = this.cronSchedule(memory.crons.values(), now);
 
     // The session folder (subagent transcripts, which can number in the hundreds) only matters
     // once the turn is over, or when a busy turn has gone quiet long enough for the silence rule.
@@ -290,10 +327,15 @@ export class ClaudeDetector implements Detector {
     const stalledMs = settings.stalledMinutes * 60_000;
     const quietMs = lastActivityAt === null ? Number.POSITIVE_INFINITY : now - lastActivityAt;
     const needFolder = file.status !== 'busy' || file.waitingFor !== undefined || (stalledMs > 0 && quietMs >= stalledMs);
-    const folder =
-      transcript && needFolder
-        ? await this.scanSessionFolder(path.join(path.dirname(transcript), file.sessionId), now, stalledMs)
-        : { latest: null, runningSubagentAt: null };
+    // Side folders (subagents, workflows) can sit next to any copy.
+    const folder: { latest: number | null; runningSubagentAt: number | null } = { latest: null, runningSubagentAt: null };
+    if (needFolder) {
+      for (const copy of copies) {
+        const found = await this.scanSessionFolder(path.join(path.dirname(copy.file), file.sessionId), now, stalledMs);
+        folder.latest = maxOf(folder.latest, found.latest);
+        folder.runningSubagentAt = maxOf(folder.runningSubagentAt, found.runningSubagentAt);
+      }
+    }
     return {
       transcriptState: info.state,
       pendingTools: info.pendingTools,
@@ -301,13 +343,55 @@ export class ClaudeDetector implements Detector {
       lastActivityAt,
       sideActivityAt: folder.latest,
       runningSubagentAt: folder.runningSubagentAt,
+      cronNextAt: schedule?.nextAt ?? null,
+      cronUntil: schedule?.until ?? null,
+      timedWaitEndsAt: memory.timedWaitEndsAt,
     };
   }
 
   /**
+   * Keeps what a session scheduled (timed waits, CronCreate jobs) after it scrolls out of the
+   * part of the transcript that is read: a long session can write megabytes after the call.
+   */
+  private remember(sessionId: string, info: TranscriptInfo): Remembered {
+    let memory = this.remembered.get(sessionId);
+    if (!memory) {
+      memory = { timedWaitEndsAt: null, crons: new Map() };
+      this.remembered.set(sessionId, memory);
+      if (this.remembered.size > 500) this.remembered.delete(this.remembered.keys().next().value!);
+    }
+    memory.timedWaitEndsAt = maxOf(memory.timedWaitEndsAt, info.timedWaitEndsAt);
+    for (const job of info.crons) memory.crons.set(job.id, job);
+    for (const id of info.deletedCrons) memory.crons.delete(id);
+    return memory;
+  }
+
+  /**
+   * The next CronCreate run that should keep the PC on, and until when (runs can start late).
+   * Recurring jobs expire after 7 days; a run more than 6 hours ahead does not count.
+   */
+  private cronSchedule(jobs: Iterable<CronJob>, now: number): { nextAt: number; until: number } | null {
+    let nextAt: number | null = null;
+    let until = 0;
+    for (const job of jobs) {
+      if (job.recurring && now > job.createdAt + CRON_MAX_AGE_MS) continue;
+      const grace = job.recurring ? CRON_RECURRING_GRACE_MS : CRON_ONE_SHOT_GRACE_MS;
+      // A recurring job: the next run, counting one that may still start late. A one-shot job:
+      // its only run, after which it deletes itself.
+      const run = nextCronTime(job.cron, job.recurring ? now - grace : job.createdAt);
+      if (run === null || now > run + grace || run - now > CRON_MAX_AHEAD_MS) continue;
+      nextAt = nextAt === null ? run : Math.min(nextAt, run);
+      until = Math.max(until, run + grace);
+    }
+    return nextAt === null ? null : { nextAt, until };
+  }
+
+  /**
    * One pass over the session's side folder: its latest write, and the newest subagent
-   * transcript that is still mid-turn. tool-results/ is skipped (written during tool calls,
-   * when the session is busy anyway). Only subagents recent enough to matter are read.
+   * transcript that is still mid-turn. Subagents live in subagents/agent-*.jsonl, workflow
+   * agents in subagents/workflows/<run>/agent-*.jsonl (plus journal.jsonl); a workflow's
+   * workflows/<run>.json appears only when it ends. tool-results/ is skipped (written during
+   * tool calls, when the session is busy anyway). Only subagents recent enough to matter are read.
    */
   private async scanSessionFolder(dir: string, now: number, stalledMs: number): Promise<{ latest: number | null; runningSubagentAt: number | null }> {
     let latest: number | null = null;
@@ -334,7 +418,8 @@ export class ClaudeDetector implements Detector {
         }
       }
     };
-    await walk(dir, 2, false);
+    // Deep enough for workflow agents: <session>/subagents/workflows/<run>/agent-*.jsonl.
+    await walk(dir, SIDE_FOLDER_DEPTH, false);
 
     const window = stalledMs > 0 ? Math.min(stalledMs, SUBAGENT_LOOKBACK_MS) : SUBAGENT_LOOKBACK_MS;
     const recent = subagents.filter((s) => now - s.mtimeMs < window).sort((a, b) => b.mtimeMs - a.mtimeMs);
@@ -411,6 +496,7 @@ export class ClaudeDetector implements Detector {
     usage: Map<string, ProcActivity> | null,
     now: number,
     maxAgeMs: number,
+    timedWaitEndsAt: number | null = null,
   ): Promise<number> {
     const signature = tools
       .map(procKey)
@@ -420,10 +506,14 @@ export class ClaudeDetector implements Detector {
     const watchedBefore = previous !== undefined && now - previous.observedAt <= maxAgeMs;
     let activeAt = watchedBefore ? previous.activeAt : now;
     const sum = (pick: (a: ProcActivity) => number): number => tools.reduce((total, p) => total + (usage?.get(procKey(p)) ? pick(usage.get(procKey(p))!) : 0), 0);
-    const sleeping = tools.some((p) => {
-      const end = sleepEndsAt(p);
-      return end !== null && now < end + SLEEP_GRACE_MS;
-    });
+    // A deliberate wait: a running `sleep N` process, or a command whose text waits
+    // (PowerShell's Start-Sleep runs inside powershell.exe, so only the command shows it).
+    const sleeping =
+      (timedWaitEndsAt !== null && now < timedWaitEndsAt + SLEEP_GRACE_MS) ||
+      tools.some((p) => {
+        const end = sleepEndsAt(p);
+        return end !== null && now < end + SLEEP_GRACE_MS;
+      });
     if (
       usage === null ||
       (watchedBefore && previous.signature !== signature) ||
@@ -439,29 +529,32 @@ export class ClaudeDetector implements Detector {
     return activeAt;
   }
 
-  /** Latest write to the session's tool output files (background task output and the like). */
+  /**
+   * Latest write to the session's tool output files (background task output and the like).
+   * The temp folder is per project, so a session that moved into a worktree has one per
+   * location: all of them count.
+   */
   private async outputActivityAt(sessionId: string, now: number): Promise<number | null> {
-    const cached = this.tempDirs.get(sessionId);
-    let dir = cached?.dir ?? null;
-    if (!cached || (cached.dir === null && now - cached.checkedAt >= MISSING_RECHECK_MS)) {
-      dir = null;
+    let cached = this.tempDirs.get(sessionId);
+    if (!cached || now - cached.checkedAt >= TEMP_RESCAN_MS) {
+      const dirs: string[] = [];
       try {
         for (const hash of await readdir(this.tempRoot)) {
           const candidate = path.join(this.tempRoot, hash, sessionId);
-          if (await isDirectory(candidate)) {
-            dir = candidate;
-            break;
-          }
+          if (await isDirectory(candidate)) dirs.push(candidate);
         }
       } catch {
-        dir = null;
+        // no temp folder yet
       }
+      cached = { dirs, checkedAt: now };
       this.tempDirs.delete(sessionId);
-      this.tempDirs.set(sessionId, { dir, checkedAt: now });
+      this.tempDirs.set(sessionId, cached);
       if (this.tempDirs.size > 500) this.tempDirs.delete(this.tempDirs.keys().next().value!);
     }
     // Background task output lives in tasks/; the rest of the folder is not needed.
-    return dir ? latestMtimeUnder(path.join(dir, 'tasks'), 0) : null;
+    let latest: number | null = null;
+    for (const dir of cached.dirs) latest = maxOf(latest, await latestMtimeUnder(path.join(dir, 'tasks'), 0));
+    return latest;
   }
 
   /** Takes a snapshot; if there is no recent one to compare with, takes a second one 2 s later. */

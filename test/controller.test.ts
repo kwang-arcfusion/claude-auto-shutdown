@@ -3,9 +3,27 @@ import { test } from 'node:test';
 import { Controller, type ActionResult, type ControllerDeps } from '../src/main/controller';
 import { msg, renderEntry } from '../src/shared/i18n';
 import { DEFAULT_SETTINGS } from '../src/shared/settings';
-import type { Aggregate, LogEntry, Settings } from '../src/shared/types';
+import type { Aggregate, LogEntry, SessionInfo, Settings } from '../src/shared/types';
 
 const MIN = 60_000;
+
+const busySession = (now: number, lastActivityAt = now): SessionInfo => ({
+  pid: 7,
+  sessionId: 's',
+  name: 'demo',
+  cwd: 'C:\\work',
+  entrypoint: 'claude-desktop',
+  status: 'busy',
+  waitingFor: null,
+  verdict: 'working',
+  blocksShutdown: true,
+  reason: msg('reason.working'),
+  lastActivityAt,
+  transcriptState: 'running',
+  toolProcesses: [],
+  helperCpuPercent: null,
+  processesChecked: false,
+});
 
 function harness(
   overrides: Partial<Settings> = {},
@@ -29,7 +47,8 @@ function harness(
       return {
         at: now,
         aggregate: current,
-        sessions: [],
+        // A busy result always has a session at work, active just now.
+        sessions: current === 'busy' ? [busySession(now)] : [],
         error: current === 'unknown' ? msg('app.checkFailed', { detail: 'detector failed' }) : null,
         claudeDir: 'C:\\claude',
         usedProcessSnapshot: false,

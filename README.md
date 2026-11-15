@@ -21,12 +21,14 @@ With the setting off, closing the window quits the app, unless it is watching. W
 
 ## How detection works
 
-- Each session writes `%USERPROFILE%\.claude\sessions\<pid>.json` with the status `busy`, `idle` or `shell`. The app also checks that the session's process is really still running.
-- **Waiting for an answer** (a permission prompt, a question, a plan to approve): counts as finished after 5 minutes. The app spots it from a tool call in the transcript that has no result yet while no shell is running.
-- **Background commands**: the app waits as long as they show activity (CPU, disk or network I/O, output, new processes). A command that has been quiet for more than 20 minutes counts as stuck, except a timed `sleep N`, which is waited out.
-- A **subagent** that is still working, or a **ScheduleWakeup** (for example from `/loop`), keeps the app waiting.
+- Each session writes `%USERPROFILE%\.claude\sessions\<pid>.json` with the status `busy`, `idle`, `waiting` or `shell`. The app also checks that the session's process is really still running.
+- **Waiting for an answer** (a permission prompt, a question, a plan or an MCP input request; status `waiting`): counts as finished after 5 minutes.
+- **Background commands**: the app waits as long as they show activity (CPU, disk or network I/O, output, new processes). A command that has been quiet for more than 20 minutes counts as stuck. A timed wait (`sleep N`, `Start-Sleep N`, `timeout /t N`) is waited out.
+- **Subagents and workflows** that are still working keep the app waiting. So does a `/loop`, whether it uses ScheduleWakeup or CronCreate, until its next run.
 - A session that says `busy` but has been silent for more than 45 minutes, and fits none of the cases above, counts as finished.
 - If the status cannot be read, the PC is never shut down.
+
+Every case, the test that covers it, and the known limits are listed in [docs/detection-cases.md](docs/detection-cases.md).
 
 ## Limitations
 

@@ -2,7 +2,7 @@
 // process list while simulated time moves forward; the controller polls every 30 s (15 s
 // during the countdown) and ticks every second, like the app. A night takes ~1 s to run.
 import assert from 'node:assert/strict';
-import { appendFileSync, mkdirSync, mkdtempSync, utimesSync, writeFileSync } from 'node:fs';
+import { appendFileSync, copyFileSync, mkdirSync, mkdtempSync, utimesSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { test } from 'node:test';
@@ -32,7 +32,7 @@ const clock = (ms: number): string => new Date(ms).toTimeString().slice(0, 8);
 const bashTool = (cmd: string): string =>
   `"C:\\Program Files\\Git\\bin\\bash.exe" -c "source /c/Users/me/.claude/shell-snapshots/snapshot-bash-1.sh && eval '${cmd}'"`;
 
-type Status = 'busy' | 'idle' | 'shell';
+type Status = 'busy' | 'idle' | 'shell' | 'waiting';
 
 interface FakeSession {
   sessionId: string;
@@ -40,6 +40,8 @@ interface FakeSession {
   status: Status;
   statusUpdatedAt: number;
   transcript: string;
+  /** Only with status "waiting": "permission prompt", "input needed", ... */
+  waitingFor?: string;
 }
 
 /** A process Claude started: it keeps cpuShare of a core busy and moves ioPerSec bytes a second. */
@@ -87,7 +89,8 @@ class Night {
     this.controller = new Controller(
       {
         now: () => this.now,
-        detect: (settings) => detector.detect(settings),
+        // Same wiring as main.ts: thorough checks inspect processes, the rest read files only.
+        detect: (settings, thorough) => detector.detect(settings, { skipProcesses: !thorough }),
         runAction: async () => {
           this.actions.push(this.now);
           return { ok: true, command: 'shutdown /s /f /t 0' };
@@ -235,6 +238,79 @@ class Night {
     this.reply(pid);
   }
 
+  /**
+   * Claude Code moves the transcript to another project folder (seen after a worktree switch on
+   * 2.1.325): the copy under the status file's cwd stops with a "relocated" entry, and writing
+   * carries on in the other folder while the status file keeps its cwd.
+   */
+  relocateTranscript(pid: number, toProject: string): void {
+    const s = this.sessions.get(pid)!;
+    const moved = path.join(this.dir, 'projects', projectSlug(`C:\\work\\${toProject}`), `${s.sessionId}.jsonl`);
+    mkdirSync(path.dirname(moved), { recursive: true });
+    copyFileSync(s.transcript, moved);
+    appendFileSync(s.transcript, `${JSON.stringify({ type: 'relocated', relocatedCwd: s.cwd, sessionId: s.sessionId })}\n`);
+    this.touch(s.transcript);
+    s.transcript = moved;
+    this.touch(moved);
+  }
+
+  /** Claude Code 2.1.325 reports an open prompt itself: status "waiting" plus waitingFor. */
+  promptWaiting(pid: number, waitingFor: 'permission prompt' | 'input needed', tool = 'Bash'): void {
+    this.callTool(pid, waitingFor === 'input needed' ? 'AskUserQuestion' : tool);
+    this.sessions.get(pid)!.waitingFor = waitingFor;
+    this.setStatus(pid, 'waiting');
+  }
+
+  /** A Workflow run: its agents write under <session>/subagents/workflows/<run>/; status stays busy. */
+  workflowWorking(pid: number, run: string, from: string, to: string): this {
+    for (let t = T(from); t < T(to); t += 2 * MIN) this.events.push({ at: t, run: () => this.workflowStep(pid, run) });
+    return this;
+  }
+
+  workflowStep(pid: number, run: string): void {
+    const s = this.sessions.get(pid)!;
+    const file = path.join(path.dirname(s.transcript), s.sessionId, 'subagents', 'workflows', run, 'agent-a1.jsonl');
+    mkdirSync(path.dirname(file), { recursive: true });
+    appendFileSync(file, `${JSON.stringify({ type: 'assistant', timestamp: new Date(this.now).toISOString(), message: { stop_reason: 'tool_use', content: [] } })}\n`);
+    this.touch(file);
+  }
+
+  /** The workflow agent finishes its turn. */
+  workflowEnd(pid: number, run: string): void {
+    const s = this.sessions.get(pid)!;
+    const file = path.join(path.dirname(s.transcript), s.sessionId, 'subagents', 'workflows', run, 'agent-a1.jsonl');
+    appendFileSync(file, `${JSON.stringify({ type: 'assistant', timestamp: new Date(this.now).toISOString(), message: { stop_reason: 'end_turn', content: [] } })}\n`);
+    this.touch(file);
+  }
+
+  /** A run_in_background PowerShell command that just waits (Start-Sleep): no CPU, no I/O, no output. */
+  backgroundWait(pid: number, command: string): void {
+    const id = this.callTool(pid, 'PowerShell', { command, run_in_background: true });
+    const proc = {
+      pid: this.nextPid++,
+      ppid: pid,
+      name: 'powershell.exe',
+      created: msToFiletime(this.now),
+      cmd: 'powershell.exe -NoProfile -Command "& ([scriptblock]::Create($env:CLAUDE_CODE_SHELL_LAUNCHER_SCRIPT))"',
+    };
+    this.tools.set(pid, [...(this.tools.get(pid) ?? []), { proc, cpuShare: 0, ioPerSec: 0, cpuTicks: 0, ioBytes: 0, lastAt: this.now }]);
+    this.toolResult(pid, id, 'Command running in background with ID: b1');
+  }
+
+  /** CronCreate (fixed-interval /loop or a reminder), then the turn ends. */
+  cronCreate(pid: number, jobId: string, cron: string, recurring = true): void {
+    const id = this.callTool(pid, 'CronCreate', { cron, prompt: 'check the build', recurring });
+    const kind = recurring ? 'recurring job' : 'one-shot task';
+    this.toolResult(pid, id, `Scheduled ${kind} ${jobId} (${cron}). Session-only (not written to disk, dies when Claude exits).`);
+    this.reply(pid);
+  }
+
+  cronDelete(pid: number, jobId: string): void {
+    const id = this.callTool(pid, 'CronDelete', { id: jobId });
+    this.toolResult(pid, id, `Cancelled job ${jobId}.`);
+    this.reply(pid);
+  }
+
   /** The process dies and leaves its session file behind (still saying busy). */
   crash(pid: number): void {
     this.sessions.delete(pid);
@@ -313,6 +389,7 @@ class Night {
         name: path.win32.basename(s.cwd),
         procStart: String(pid * 1_000),
         status: s.status,
+        ...(s.status === 'waiting' && s.waitingFor ? { waitingFor: s.waitingFor } : {}),
         statusUpdatedAt: s.statusUpdatedAt,
         updatedAt: s.statusUpdatedAt,
         entrypoint: 'claude-desktop',
@@ -611,4 +688,80 @@ test('a /loop with scheduled wake-ups keeps the machine on until the loop stops'
   await night.run();
   night.expectNoCountdownBefore('00:40');
   night.expectShutdownBetween('01:10', '01:12');
+});
+
+// ---- Claude Code moving things around --------------------------------------------------------
+
+test('a transcript moved to another project folder (worktree switch) is followed; no early shutdown', async () => {
+  const night = new Night();
+  night
+    .at('23:00', () => start(night))
+    .working(100, '23:00', '03:00')
+    .at('00:30', () => night.relocateTranscript(100, 'app-main'))
+    .at('03:00', () => night.reply(100));
+  await night.run();
+  night.expectNoCountdownBefore('03:00');
+  night.expectShutdownBetween('03:30', '03:32');
+});
+
+// ---- Claude Code 2.1.325 behaviour found in the binary --------------------------------------
+
+test('desktop: a permission prompt (status "waiting") counts as finished after 5 minutes', async () => {
+  const night = new Night();
+  night
+    .at('23:00', () => start(night))
+    .working(100, '23:00', '00:00')
+    .at('00:00', () => night.promptWaiting(100, 'permission prompt'));
+  await night.run();
+  night.expectNoCountdownBefore('00:15');
+  night.expectShutdownBetween('00:35', '00:37');
+});
+
+test('a long workflow keeps the machine on while its agents work, even with a quiet main transcript', async () => {
+  const night = new Night();
+  night
+    .at('23:00', () => start(night))
+    .working(100, '23:00', '23:10')
+    .workflowWorking(100, 'wf_1', '23:10', '01:00')
+    .at('01:00', () => {
+      night.workflowEnd(100, 'wf_1');
+      night.reply(100);
+    });
+  await night.run();
+  night.expectNoCountdownBefore('01:00');
+  night.expectShutdownBetween('01:30', '01:33');
+});
+
+test('a background PowerShell Start-Sleep is waited out (no CPU, no output), then Claude carries on', async () => {
+  const night = new Night();
+  night
+    .at('23:00', () => start(night))
+    .working(100, '23:00', '23:10')
+    .at('23:10', () => {
+      night.backgroundWait(100, 'Start-Sleep -Seconds 3600; gh run view');
+      night.reply(100);
+    })
+    .at('00:10', () => {
+      night.backgroundEnd(100);
+      night.prompt(100);
+    })
+    .working(100, '00:10', '00:20')
+    .at('00:20', () => night.reply(100));
+  await night.run();
+  night.expectNoCountdownBefore('00:20');
+  night.expectShutdownBetween('00:50', '00:52');
+});
+
+test('an hourly /loop (CronCreate) keeps the machine on between runs until it is deleted', async () => {
+  const night = new Night();
+  night
+    .at('23:00', () => start(night))
+    .working(100, '23:00', '23:20')
+    .at('23:20', () => night.cronCreate(100, 'job1', '0 * * * *')) // next run 00:00
+    .at('00:00', () => night.prompt(100))
+    .working(100, '00:00', '00:06')
+    .at('00:06', () => night.cronDelete(100, 'job1'));
+  await night.run();
+  night.expectNoCountdownBefore('00:06');
+  night.expectShutdownBetween('00:36', '00:38');
 });

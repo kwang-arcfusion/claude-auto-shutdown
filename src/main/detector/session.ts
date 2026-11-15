@@ -8,9 +8,11 @@ import type { PendingTool } from './transcript';
  * (desktop app sessions and CLI alike). Internal format, observed on Claude Code 2.1.325:
  * {"pid":28348,"sessionId":"…","cwd":"…","procStart":"134391962772404597","status":"busy",
  *  "statusUpdatedAt":1794723027028,"updatedAt":…,"entrypoint":"claude-desktop",…}
- * status is "busy", "idle" or "shell" (turn over, a shell still running). waitingFor is set
- * while one of Claude Code's own dialogs waits ("dialog open", "sandbox request", ...); tool
- * permission prompts in the desktop app are shown by the app and do not set it.
+ * status is "busy", "idle", "shell" (turn over, a background shell still running; terminal
+ * only) or "waiting" (a permission prompt, question, dialog or MCP input request is open), with
+ * waitingFor saying which: "permission prompt", "input needed", "dialog open", ...
+ * The file is written only when these change (no heartbeat): a session can stay "busy" for
+ * hours while background agents or workflows run.
  */
 export interface SessionFile {
   pid: number;
@@ -25,6 +27,8 @@ export interface SessionFile {
   statusUpdatedAt?: number;
   entrypoint?: string;
   kind?: string;
+  /** Claude Code version that wrote the file, e.g. "2.1.325". */
+  version?: string;
 }
 
 export function parseSessionFile(text: string): SessionFile | null {
@@ -54,6 +58,7 @@ export function parseSessionFile(text: string): SessionFile | null {
     statusUpdatedAt: num(r.statusUpdatedAt),
     entrypoint: str(r.entrypoint),
     kind: str(r.kind),
+    version: str(r.version),
   };
 }
 
@@ -69,6 +74,12 @@ export interface SessionActivity {
   scheduledWakeAt: number | null;
   /** Latest write of a subagent transcript that is still mid-turn (ms). */
   runningSubagentAt: number | null;
+  /** The next run of a CronCreate job (fixed-interval /loop, reminder) that keeps the PC on (ms). */
+  cronNextAt?: number | null;
+  /** ...until this time: the run may start late (jitter), so a grace period is added (ms). */
+  cronUntil?: number | null;
+  /** When a timed wait in a command Claude started (Start-Sleep 600, sleep 10m...) ends (ms). */
+  timedWaitEndsAt?: number | null;
 }
 
 export interface ProcessFacts {
@@ -112,9 +123,17 @@ export const WAKE_GRACE_MS = 5 * MIN;
 const CHILD_TIME_SLACK_MS = 2_000;
 /** Helper CPU can stretch the silence rule of a busy turn, but only this far. */
 export const HELPER_EXTENSION_MAX_MS = 3 * 60 * MIN;
+/** Helper CPU after the turn keeps the PC on this long when toolStallMinutes is 0 (off). */
+const HELPER_AFTER_TURN_DEFAULT_MS = 20 * MIN;
 
-/** The statuses Claude Code writes (verified on 2.1.325). Anything else means its format changed. */
-export const KNOWN_STATUSES: ReadonlySet<string> = new Set(['busy', 'idle', 'shell']);
+/**
+ * The statuses Claude Code writes (verified in the 2.1.325 binary: ["busy","shell","idle","waiting"]).
+ * "waiting" = a permission prompt, a question, a dialog or an MCP input request is open.
+ * Anything else means its format changed.
+ */
+export const KNOWN_STATUSES: ReadonlySet<string> = new Set(['busy', 'idle', 'shell', 'waiting']);
+/** From this version on, Claude Code reports prompts itself (status "waiting"), so they are not guessed. */
+const REPORTS_WAITING_FROM = '2.1.325';
 
 /** Tools that always wait for the user (value: what they wait for, a "what.<value>" text). */
 const QUESTION_TOOLS: Record<string, string> = { AskUserQuestion: 'question', ExitPlanMode: 'plan' };
@@ -122,12 +141,27 @@ const QUESTION_TOOLS: Record<string, string> = { AskUserQuestion: 'question', Ex
 const SHELL_TOOLS = new Set(['Bash', 'PowerShell']);
 /** Tools that finish within seconds once allowed: still pending after the grace period = permission prompt. */
 const INSTANT_TOOLS = new Set(['Edit', 'Write', 'MultiEdit', 'NotebookEdit', 'Read', 'Grep', 'Glob']);
-/** Claude Code's waitingFor values → "what.<value>" texts. */
+/** Claude Code's waitingFor values → "what.<value>" texts ("permission prompt" is handled apart). */
 const WAITING_FOR: Record<string, string> = {
+  'input needed': 'input',
   'dialog open': 'dialog',
   'sandbox request': 'sandbox',
   'goal proposal': 'goal',
+  'worker request': 'worker',
 };
+
+/** -1, 0 or 1 for dotted version numbers ("2.1.325"); null when either cannot be read. */
+export function compareVersions(a: string | undefined, b: string): number | null {
+  if (!a) return null;
+  const pa = a.split('.').map((n) => Number.parseInt(n, 10));
+  const pb = b.split('.').map((n) => Number.parseInt(n, 10));
+  if (pa.some((n) => !Number.isFinite(n))) return null;
+  for (let i = 0; i < Math.max(pa.length, pb.length); i++) {
+    const d = (pa[i] ?? 0) - (pb[i] ?? 0);
+    if (d !== 0) return d > 0 ? 1 : -1;
+  }
+  return 0;
+}
 
 export function maxOf(...values: Array<number | null | undefined>): number | null {
   let max: number | null = null;
@@ -149,31 +183,42 @@ const result = (verdict: SessionVerdict, blocksShutdown: boolean, reason: Messag
 /** `what` holds the params of a "what.<value>" text: {what: 'permission', tool: 'Bash'}. */
 type Waiting = { since: number; what: MessageParams } | 'check' | null;
 
-const waitingForWhat = (value: string): MessageParams => (WAITING_FOR[value] ? { what: WAITING_FOR[value] } : { what: 'other', value });
+function waitingForWhat(value: string | undefined, pending: readonly PendingTool[]): MessageParams {
+  if (value === undefined) return { what: 'input' };
+  if (value === 'permission prompt') {
+    const tool = pending.at(-1)?.name;
+    return tool ? { what: 'permission', tool } : { what: 'permissionAny' };
+  }
+  return WAITING_FOR[value] ? { what: WAITING_FOR[value] } : { what: 'other', value };
+}
 
 /** Is the session waiting for the user? 'check' = only a process snapshot can tell. */
 function detectWaiting(input: EvaluateInput, busy: boolean, latest: number | null, toolsRunning: boolean | null): Waiting {
   const { file, now, processes } = input;
-  if (file.waitingFor !== undefined) return { since: latest ?? now, what: waitingForWhat(file.waitingFor) };
+  // Claude Code says so itself (status "waiting"); statusUpdatedAt is written when it starts.
+  if (file.status === 'waiting' || file.waitingFor !== undefined) {
+    return { since: file.statusUpdatedAt ?? latest ?? now, what: waitingForWhat(file.waitingFor, input.pendingTools) };
+  }
   if (!busy) return null;
+  // A version that reports prompts itself is not waiting while it says "busy": a slow tool is
+  // just slow. Older versions only show a prompt as a tool call that does not start.
+  if ((compareVersions(file.version, REPORTS_WAITING_FROM) ?? -1) >= 0) return null;
   let needsCheck = false;
   for (const tool of input.pendingTools) {
     const at = tool.at ?? latest ?? now;
     const question = QUESTION_TOOLS[tool.name];
     if (question) return { since: at, what: { what: question } };
     if (now - at < PERMISSION_GRACE_MS) continue;
-    if (INSTANT_TOOLS.has(tool.name)) return { since: at, what: { what: 'permission', tool: tool.name } };
-    if (SHELL_TOOLS.has(tool.name)) {
-      if (processes === null || toolsRunning === null) {
-        needsCheck = true;
-        continue;
-      }
-      // An allowed command starts processes. Anything started since the call (even a shell
-      // without a known marker) or any helper activity means it is running, not waiting.
-      const newest = processes.newestChildAt ?? null;
-      const startedSince = newest !== null && newest >= at - CHILD_TIME_SLACK_MS;
-      if (!toolsRunning && !startedSince && processes.helpersActiveNow !== true) return { since: at, what: { what: 'permission', tool: tool.name } };
+    if (!INSTANT_TOOLS.has(tool.name) && !SHELL_TOOLS.has(tool.name)) continue;
+    if (processes === null || toolsRunning === null) {
+      needsCheck = true;
+      continue;
     }
+    // An allowed tool shows up as processes: a shell, ripgrep, a hook it triggers. Anything
+    // started since the call, or any helper activity, means it is running, not waiting.
+    const newest = processes.newestChildAt ?? null;
+    const startedSince = newest !== null && newest >= at - CHILD_TIME_SLACK_MS;
+    if (!toolsRunning && !startedSince && processes.helpersActiveNow !== true) return { since: at, what: { what: 'permission', tool: tool.name } };
   }
   return needsCheck ? 'check' : null;
 }
@@ -253,6 +298,9 @@ export function evaluateSession(input: EvaluateInput): Evaluation {
   if (input.scheduledWakeAt !== null && now < input.scheduledWakeAt + WAKE_GRACE_MS) {
     return result('scheduled', true, msg('reason.scheduled', { at: input.scheduledWakeAt }));
   }
+  if (input.cronNextAt != null && input.cronUntil != null && now < input.cronUntil) {
+    return result('scheduled', true, msg('reason.scheduled', { at: input.cronNextAt }));
+  }
   if (input.runningSubagentAt !== null && (stalledMs <= 0 || now - input.runningSubagentAt < stalledMs)) {
     return result('background', true, msg('reason.subagent'));
   }
@@ -261,7 +309,7 @@ export function evaluateSession(input: EvaluateInput): Evaluation {
   }
   // Helper CPU after the turn (headless browser, busy MCP server...) counts only for a while.
   const turnOverForMs = now - (file.statusUpdatedAt ?? latest ?? now);
-  if (helperBusy && (toolStallMs <= 0 || turnOverForMs < toolStallMs)) {
+  if (helperBusy && turnOverForMs < (toolStallMs > 0 ? toolStallMs : HELPER_AFTER_TURN_DEFAULT_MS)) {
     return result('background', true, msg('reason.helperCpu', { cpu: processes!.helperCpuPercent!.toFixed(1) }));
   }
   if (hung.length > 0) {

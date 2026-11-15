@@ -337,10 +337,17 @@ export class Controller {
       if (this.phase !== 'countdown') return; // cancelled while checking
       if (result.aggregate === 'idle') {
         // One last cheap look at the session files right before acting: a turn may have
-        // started during the seconds the process snapshot took.
+        // started during the seconds the process snapshot took. Files alone cannot settle some
+        // sessions (a shell, a quiet turn, a prompt): the thorough check just did, so only
+        // activity since it started counts. Anything unreadable means: do not act yet.
         const latest = await this.detect(false, true);
         if (this.phase !== 'countdown') return;
-        if (latest.aggregate === 'busy') {
+        if (latest.aggregate === 'unknown') {
+          this.recordDetection(latest);
+          this.finalCheckFailed();
+          return;
+        }
+        if (latest.sessions.some((s) => s.blocksShutdown && (s.lastActivityAt ?? 0) >= result.at)) {
           this.recordDetection(latest);
           this.backToMonitoring('log.lastMomentBusy');
           return;
@@ -349,16 +356,21 @@ export class Controller {
       } else if (result.aggregate === 'busy') {
         this.backToMonitoring('log.finalCheckBusy');
       } else {
-        this.finalCheckFailures++;
-        if (this.finalCheckFailures >= FINAL_CHECK_MAX_FAILURES) {
-          this.backToMonitoring('log.finalCheckFailedTooOften', { count: FINAL_CHECK_MAX_FAILURES });
-        } else {
-          this.countdownEndsAt = this.deps.now() + FINAL_CHECK_RETRY_MS;
-          this.addLog('warn', 'log.finalCheckRetry');
-        }
+        this.finalCheckFailed();
       }
     } finally {
       this.deps.onChange();
+    }
+  }
+
+  /** The final check could not tell: retry in 15 s, and give up after a few tries. */
+  private finalCheckFailed(): void {
+    this.finalCheckFailures++;
+    if (this.finalCheckFailures >= FINAL_CHECK_MAX_FAILURES) {
+      this.backToMonitoring('log.finalCheckFailedTooOften', { count: FINAL_CHECK_MAX_FAILURES });
+    } else {
+      this.countdownEndsAt = this.deps.now() + FINAL_CHECK_RETRY_MS;
+      this.addLog('warn', 'log.finalCheckRetry');
     }
   }
 

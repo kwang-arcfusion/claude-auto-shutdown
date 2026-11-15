@@ -288,3 +288,48 @@ test('a status this app does not know counts as working, never as finished', () 
   assert.equal(checked.blocksShutdown, true);
   assert.equal(checked.needsProcessCheck, false);
 });
+
+// ---- Claude Code 2.1.325: status "waiting", versions, schedules -------------------------
+
+test('status "waiting": a prompt or question that counts as finished after waitingMinutes', () => {
+  const prompt = evaluateSession(
+    input({ status: 'waiting', waitingFor: 'permission prompt', statusUpdatedAt: NOW - 2 * MIN }, { pendingTools: [pending('Bash', 2 * MIN)] }),
+  );
+  assert.equal(prompt.verdict, 'waiting');
+  assert.equal(prompt.blocksShutdown, true);
+  assert.equal(text(prompt.reason), 'Waiting for you to allow Bash');
+
+  const question = evaluateSession(input({ status: 'waiting', waitingFor: 'input needed', statusUpdatedAt: NOW - MIN }));
+  assert.equal(text(question.reason), 'Waiting for you to provide input');
+  assert.equal(render('th', question.reason), 'รอผู้ใช้ตอบสิ่งที่ถาม');
+
+  // Timed from when the status changed, not from the last transcript write.
+  const late = evaluateSession(input({ status: 'waiting', waitingFor: 'permission prompt', statusUpdatedAt: NOW - 6 * MIN }));
+  assert.equal(late.verdict, 'stalled');
+  assert.equal(late.blocksShutdown, false);
+  assert.equal(text(late.reason), 'Waited over 5 min for you to allow a tool, so it counts as finished');
+});
+
+test('a version that reports prompts itself is never guessed to be waiting while "busy"', () => {
+  const slowRead = input({ status: 'busy', version: '2.1.325' }, { pendingTools: [pending('Read', 3 * MIN)] });
+  assert.equal(evaluateSession(slowRead).verdict, 'working');
+  const older = input({ status: 'busy' }, { pendingTools: [pending('Read', 3 * MIN)] });
+  assert.equal(evaluateSession(older).verdict, 'waiting');
+  // Older versions: a tool that started processes since the call (a hook, ripgrep) is running.
+  const hook = input({ status: 'busy' }, { pendingTools: [pending('Edit', 3 * MIN)], processes: facts({ newestChildAt: NOW - 2 * MIN, helpersActiveNow: false }) });
+  assert.equal(evaluateSession(hook).verdict, 'working');
+});
+
+test('a due CronCreate run keeps the session scheduled until its grace period ends', () => {
+  const due = evaluateSession(input({ status: 'idle' }, { cronNextAt: NOW + 20 * MIN, cronUntil: NOW + 55 * MIN }));
+  assert.equal(due.verdict, 'scheduled');
+  assert.equal(due.blocksShutdown, true);
+  assert.equal(evaluateSession(input({ status: 'idle' }, { cronNextAt: NOW - 40 * MIN, cronUntil: NOW - MIN })).verdict, 'idle');
+});
+
+test('helper CPU after the turn is limited even when toolStallMinutes is 0', () => {
+  const settings = { ...DEFAULT_SETTINGS, toolStallMinutes: 0 };
+  const busyHelpers = facts({ helperCpuPercent: 50 });
+  assert.equal(evaluateSession(input({ status: 'idle', statusUpdatedAt: NOW - 5 * MIN }, { processes: busyHelpers, settings })).verdict, 'background');
+  assert.equal(evaluateSession(input({ status: 'idle', statusUpdatedAt: NOW - 30 * MIN }, { processes: busyHelpers, settings })).verdict, 'idle');
+});

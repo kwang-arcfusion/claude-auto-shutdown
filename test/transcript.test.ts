@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { mkdtempSync, statSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, statSync, utimesSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { test } from 'node:test';
@@ -9,7 +9,10 @@ import {
   classifyTranscriptLines,
   projectSlug,
   readTranscriptState,
+  timedWaitSeconds,
+  TRANSCRIPT_RESCAN_MS,
   TranscriptInfoCache,
+  TranscriptLocator,
 } from '../src/main/detector/transcript';
 
 const line = (entry: object): string => JSON.stringify(entry);
@@ -126,4 +129,82 @@ test('TranscriptInfoCache evicts only the least recently used entry when full', 
 
 test('projectSlug matches Claude Code project folder names', () => {
   assert.equal(projectSlug('C:\\Users\\me\\Desktop\\my-app'), 'C--Users-me-Desktop-my-app');
+});
+
+test('a session that moved into a worktree: the most recently written copy is the live one', async () => {
+  // The status file's cwd names the worktree, but Claude keeps writing where the session started.
+  const projects = mkdtempSync(path.join(os.tmpdir(), 'cas-projects-'));
+  const worktree = 'C:\repo\.claude\worktrees\feature';
+  const copy = (slug: string, ageMs: number): string => {
+    mkdirSync(path.join(projects, slug), { recursive: true });
+    const file = path.join(projects, slug, 's1.jsonl');
+    writeFileSync(file, `${stopHooks}\n`);
+    const at = (Date.now() - ageMs) / 1000;
+    utimesSync(file, at, at);
+    return file;
+  };
+  const left = copy(projectSlug(worktree), 4 * 60 * 60_000);
+  const live = copy(projectSlug('C:\repo'), 1_000);
+
+  const locator = new TranscriptLocator();
+  const now = Date.now();
+  const copies = await locator.locateAll(projects, 's1', worktree, now);
+  assert.deepEqual(
+    copies.map((c) => c.file),
+    [live, left],
+  );
+  assert.equal(await locator.locate(projects, 's1', worktree, now), live);
+
+  // A copy that appears in yet another folder is found on the next search.
+  const moved = copy('C--elsewhere', 0);
+  utimesSync(moved, new Date(now + 5_000), new Date(now + 5_000));
+  assert.equal(await locator.locate(projects, 's1', worktree, now + 1_000), live); // cached list
+  assert.equal(await locator.locate(projects, 's1', worktree, now + TRANSCRIPT_RESCAN_MS), moved);
+});
+
+test('max_tokens does not end a turn (Claude Code continues by itself)', () => {
+  assert.equal(classifyTranscriptLines([assistant('max_tokens')]), 'running');
+});
+
+test('timedWaitSeconds reads deliberate waits in shell commands', () => {
+  assert.equal(timedWaitSeconds('Start-Sleep -Seconds 3600; gh run view'), 3600);
+  assert.equal(timedWaitSeconds('Start-Sleep 90'), 90);
+  assert.equal(timedWaitSeconds('Start-Sleep -s 30'), 30);
+  assert.equal(timedWaitSeconds('Start-Sleep -Milliseconds 500'), 0.5);
+  assert.equal(timedWaitSeconds('sleep 10m && make'), 600);
+  assert.equal(timedWaitSeconds('cmd /c timeout /t 120 /nobreak'), 120);
+  assert.equal(timedWaitSeconds('python -c "import time; time.sleep(45)"'), 45);
+  assert.equal(timedWaitSeconds('sleep 5; sleep 5'), 10);
+  assert.equal(timedWaitSeconds('sleep 999999'), 6 * 3600); // capped like a running sleep
+  assert.equal(timedWaitSeconds('npm test'), 0);
+  assert.equal(timedWaitSeconds('Get-Process | Sort-Object CPU'), 0);
+});
+
+test('CronCreate / CronDelete jobs and timed waits are read from tool calls', () => {
+  const t = '2026-11-15T16:00:00.000Z';
+  const call = (id: string, name: string, input: object): string =>
+    line({ type: 'assistant', timestamp: t, message: { role: 'assistant', stop_reason: 'tool_use', content: [{ type: 'tool_use', id, name, input }] } });
+  const lines = [
+    call('c1', 'CronCreate', { cron: '*/30 * * * *', prompt: 'check CI' }),
+    user([{ type: 'tool_result', tool_use_id: 'c1', content: 'Scheduled recurring job a1b2c3 (every 30 minutes). Auto-expires after 7 days.' }], { timestamp: t }),
+    call('c2', 'CronCreate', { cron: '0 9 * * *', prompt: 'remind me', recurring: false }),
+    user([{ type: 'tool_result', tool_use_id: 'c2', content: [{ type: 'text', text: 'Scheduled one-shot task d4e5 (at 9:00). It will fire once then auto-delete.' }] }], { timestamp: t }),
+    call('p1', 'PowerShell', { command: 'Start-Sleep -Seconds 600; gh run view', run_in_background: true }),
+  ];
+  const info = analyzeTranscriptLines(lines);
+  assert.deepEqual(
+    info.crons.map((c) => [c.id, c.cron, c.recurring, c.createdAt]),
+    [
+      ['a1b2c3', '*/30 * * * *', true, Date.parse(t)],
+      ['d4e5', '0 9 * * *', false, Date.parse(t)],
+    ],
+  );
+  assert.equal(info.timedWaitEndsAt, Date.parse(t) + 600_000);
+
+  const deleted = analyzeTranscriptLines([...lines, call('d1', 'CronDelete', { id: 'a1b2c3' })]);
+  assert.deepEqual(
+    deleted.crons.map((c) => c.id),
+    ['d4e5'],
+  );
+  assert.deepEqual(deleted.deletedCrons, ['a1b2c3']);
 });

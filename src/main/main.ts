@@ -129,6 +129,8 @@ function main(): void {
   let onTop = false;
   let toldAboutTray = false;
   let lastReloadAt = 0;
+  /** When the PC last woke up: time asleep is not silence (Claude was frozen too). */
+  let resumedAt: number | null = null;
   const icons = new Map<string, NativeImage>();
 
   // Unattended overnight: log unexpected errors and keep going, never block on an error dialog.
@@ -145,7 +147,7 @@ function main(): void {
   const controller: Controller = new Controller(
     {
       now: Date.now,
-      detect: (settings, thorough) => detector.detect(settings, { skipProcesses: !thorough }),
+      detect: (settings, thorough) => detector.detect(settings, { skipProcesses: !thorough, activeSince: resumedAt ?? undefined }),
       runAction: async (settings, dryRun) => {
         const command = buildActionCommand(settings.action, settings.forceCloseApps);
         if (dryRun) return { ok: true, command: command.display };
@@ -471,6 +473,7 @@ function main(): void {
       setInterval(() => logs.store?.prune(), 60 * 60 * 1000); // keep only the last 7 days
       powerMonitor.on('suspend', () => controller.addLog('info', 'app.suspending'));
       powerMonitor.on('resume', () => {
+        resumedAt = Date.now();
         controller.onResume();
         schedulePoll(0);
       });

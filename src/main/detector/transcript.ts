@@ -6,8 +6,48 @@ import type { TranscriptState } from '../../shared/types';
 const ENDED_SYSTEM_SUBTYPES = new Set(['stop_hook_summary', 'turn_duration']);
 /** Entries written while a model request is in flight. */
 const RUNNING_TYPES = new Set(['api-request', 'api-request-blob', 'progress']);
-/** Assistant stop reasons that do not end the turn. */
-const CONTINUING_STOP_REASONS = new Set(['tool_use', 'pause_turn']);
+/** Assistant stop reasons that do not end the turn (max_tokens: Claude Code resumes by itself). */
+const CONTINUING_STOP_REASONS = new Set(['tool_use', 'pause_turn', 'max_tokens']);
+/** Tools whose input.command runs in a shell. */
+const COMMAND_TOOLS = new Set(['Bash', 'PowerShell', 'Monitor']);
+/** Timed waits are trusted only this far (same limit as a running `sleep` process). */
+const MAX_TIMED_WAIT_SECONDS = 6 * 3600;
+const SECONDS_PER_UNIT: Record<string, number> = { '': 1, s: 1, m: 60, h: 3600, d: 86400 };
+
+/**
+ * Seconds a shell command deliberately waits: PowerShell `Start-Sleep 600` / `-Seconds 600` /
+ * `-Milliseconds 500` and its `sleep` alias, `sleep 10m`, `timeout /t 60`, `time.sleep(5)`. Several
+ * waits add up; the total is capped. 0 when there is none.
+ */
+export function timedWaitSeconds(command: string): number {
+  let total = 0;
+  for (const m of command.matchAll(/\bStart-Sleep\b\s*(?:-(\w+)\s*)?(\d+(?:\.\d+)?)/gi)) {
+    total += /^m/i.test(m[1] ?? '') ? Number(m[2]) / 1000 : Number(m[2]);
+  }
+  for (const m of command.matchAll(/(?:^|[\s;&|(])sleep\s+(\d+(?:\.\d+)?)([smhd]?)(?![\w.])/gi)) {
+    total += Number(m[1]) * SECONDS_PER_UNIT[m[2]!.toLowerCase()]!;
+  }
+  for (const m of command.matchAll(/\btimeout(?:\.exe)?\s+[/-]t\s+(\d+)/gi)) total += Number(m[1]);
+  for (const m of command.matchAll(/\btime\.sleep\(\s*(\d+(?:\.\d+)?)\s*\)/g)) total += Number(m[1]);
+  return Number.isFinite(total) ? Math.min(total, MAX_TIMED_WAIT_SECONDS) : 0;
+}
+
+/** A CronCreate job (fixed-interval /loop, reminder). Claude Code keeps it in memory only. */
+export interface CronJob {
+  id: string;
+  cron: string;
+  recurring: boolean;
+  createdAt: number;
+}
+
+function resultText(block: Record<string, unknown>): string {
+  const content = block.content;
+  if (typeof content === 'string') return content;
+  if (!Array.isArray(content)) return '';
+  return content
+    .map((part) => (part !== null && typeof part === 'object' && typeof (part as { text?: unknown }).text === 'string' ? (part as { text: string }).text : ''))
+    .join('\n');
+}
 
 type Entry = Record<string, unknown> & { type: string };
 
@@ -86,11 +126,30 @@ export interface TranscriptInfo {
   pendingTools: PendingTool[];
   /** When the latest ScheduleWakeup call will wake the session (ms), unless the loop was stopped. */
   scheduledWakeAt: number | null;
+  /** When the latest timed wait in a command ends (ms): `Start-Sleep 3600` started then plus an hour. */
+  timedWaitEndsAt: number | null;
+  /** CronCreate jobs created and not deleted in the part that was read. */
+  crons: CronJob[];
+  /** Job ids deleted with CronDelete in the part that was read. */
+  deletedCrons: string[];
 }
+
+export const emptyTranscriptInfo = (): TranscriptInfo => ({
+  state: 'unknown',
+  pendingTools: [],
+  scheduledWakeAt: null,
+  timedWaitEndsAt: null,
+  crons: [],
+  deletedCrons: [],
+});
 
 export function analyzeTranscriptLines(lines: readonly string[]): TranscriptInfo {
   const pending = new Map<string, PendingTool>();
+  const cronCalls = new Map<string, { cron: string; at: number | null }>();
+  const crons = new Map<string, CronJob>();
+  const deletedCrons: string[] = [];
   let scheduledWakeAt: number | null = null;
+  let timedWaitEndsAt: number | null = null;
   for (const line of lines) {
     const entry = parseEntry(line);
     if (!entry) continue;
@@ -100,22 +159,46 @@ export function analyzeTranscriptLines(lines: readonly string[]): TranscriptInfo
       for (const block of blocksOf(entry)) {
         if (block.type !== 'tool_use' || typeof block.id !== 'string') continue;
         const name = typeof block.name === 'string' ? block.name : '';
+        const input = (block.input ?? {}) as Record<string, unknown>;
         pending.set(block.id, { id: block.id, name, at });
         if (name === 'ScheduleWakeup') {
-          const input = (block.input ?? {}) as Record<string, unknown>;
           const delay = Number(input.delaySeconds);
           if (input.stop === true) scheduledWakeAt = null;
           else if (at !== null && Number.isFinite(delay)) scheduledWakeAt = at + Math.min(3600, Math.max(60, delay)) * 1000;
+        } else if (name === 'CronCreate' && typeof input.cron === 'string') {
+          cronCalls.set(block.id, { cron: input.cron, at });
+        } else if (name === 'CronDelete' && typeof input.id === 'string') {
+          crons.delete(input.id);
+          deletedCrons.push(input.id);
+        } else if (COMMAND_TOOLS.has(name) && typeof input.command === 'string' && at !== null) {
+          const seconds = timedWaitSeconds(input.command);
+          if (seconds > 0) timedWaitEndsAt = Math.max(timedWaitEndsAt ?? 0, at + seconds * 1000);
         }
       }
     } else if (entry.type === 'user') {
       for (const block of blocksOf(entry)) {
-        if (block.type === 'tool_result' && typeof block.tool_use_id === 'string') pending.delete(block.tool_use_id);
+        if (block.type !== 'tool_result' || typeof block.tool_use_id !== 'string') continue;
+        pending.delete(block.tool_use_id);
+        const call = cronCalls.get(block.tool_use_id);
+        if (call && block.is_error !== true) {
+          // "Scheduled recurring job <id> (...)" / "Scheduled one-shot task <id> (...)"
+          const text = resultText(block);
+          const match = /Scheduled (recurring job|one-shot task) (\S+) \(/.exec(text);
+          const id = match?.[2] ?? block.tool_use_id;
+          crons.set(id, { id, cron: call.cron, recurring: match ? match[1] === 'recurring job' : true, createdAt: call.at ?? at ?? 0 });
+        }
       }
     }
     if (endsTurn(entry)) pending.clear(); // calls left from an interrupted turn no longer matter
   }
-  return { state: classifyTranscriptLines(lines), pendingTools: [...pending.values()], scheduledWakeAt };
+  return {
+    state: classifyTranscriptLines(lines),
+    pendingTools: [...pending.values()],
+    scheduledWakeAt,
+    timedWaitEndsAt,
+    crons: [...crons.values()],
+    deletedCrons,
+  };
 }
 
 async function readTail(file: string, size: number, maxBytes: number): Promise<string[]> {
@@ -133,7 +216,7 @@ async function readTail(file: string, size: number, maxBytes: number): Promise<s
 }
 
 export async function readTranscriptInfo(file: string, size: number): Promise<TranscriptInfo> {
-  let info: TranscriptInfo = { state: 'unknown', pendingTools: [], scheduledWakeAt: null };
+  let info: TranscriptInfo = emptyTranscriptInfo();
   // Tool results can make single lines huge, so widen the window once if needed.
   for (const window of [256 * 1024, 4 * 1024 * 1024]) {
     info = analyzeTranscriptLines(await readTail(file, size, window));
@@ -187,42 +270,72 @@ async function exists(file: string): Promise<boolean> {
   }
 }
 
-const MISSING_RECHECK_MS = 5 * 60_000;
+/** How often to look again for copies of a session's transcript in other project folders. */
+export const TRANSCRIPT_RESCAN_MS = 2 * 60_000;
 
-/** Finds `<claudeDir>/projects/<slug>/<sessionId>.jsonl`, falling back to a scan of all projects. */
+export interface TranscriptCopy {
+  file: string;
+  mtimeMs: number;
+  size: number;
+}
+
+/**
+ * Finds `<claudeDir>/projects/<slug>/<sessionId>.jsonl`. One session can have copies in several
+ * project folders: after it moves into a worktree, the status file's cwd names the worktree while
+ * Claude keeps writing the transcript under the folder it started in (the copy it left ends with
+ * a "relocated" entry). So every folder is searched, and the most recently written copy is the
+ * live one; the cwd alone can point at a copy that stopped hours ago.
+ */
 export class TranscriptLocator {
-  private readonly cache = new Map<string, { file: string | null; checkedAt: number }>();
+  private readonly cache = new Map<string, { files: string[]; checkedAt: number }>();
 
-  async locate(projectsDir: string, sessionId: string, cwd: string | undefined, now: number): Promise<string | null> {
-    const cached = this.cache.get(sessionId);
-    if (cached?.file && (await exists(cached.file))) return cached.file;
-    if (cached && !cached.file && now - cached.checkedAt < MISSING_RECHECK_MS) return null;
-
-    const name = `${sessionId}.jsonl`;
-    let found: string | null = null;
-    if (cwd) {
-      const direct = path.join(projectsDir, projectSlug(cwd), name);
-      if (await exists(direct)) found = direct;
+  /** Every copy of the session's transcript, most recently written first. */
+  async locateAll(projectsDir: string, sessionId: string, cwd: string | undefined, now: number): Promise<TranscriptCopy[]> {
+    let entry = this.cache.get(sessionId);
+    if (!entry || now - entry.checkedAt >= TRANSCRIPT_RESCAN_MS) {
+      entry = { files: await this.search(projectsDir, sessionId, cwd), checkedAt: now };
+      this.cache.delete(sessionId);
+      this.cache.set(sessionId, entry);
+      if (this.cache.size > 500) this.cache.delete(this.cache.keys().next().value!);
     }
-    if (!found) {
-      let dirs: string[] = [];
-      try {
-        dirs = await readdir(projectsDir);
-      } catch {
-        dirs = [];
-      }
-      for (const dir of dirs) {
-        const candidate = path.join(projectsDir, dir, name);
-        if (await exists(candidate)) {
-          found = candidate;
-          break;
+    const copies = await Promise.all(
+      entry.files.map(async (file): Promise<TranscriptCopy | null> => {
+        try {
+          const stats = await stat(file);
+          return { file, mtimeMs: stats.mtimeMs, size: stats.size };
+        } catch {
+          return null; // deleted since the search
         }
-      }
-    }
-    this.cache.delete(sessionId);
-    this.cache.set(sessionId, { file: found, checkedAt: now });
-    if (this.cache.size > 500) this.cache.delete(this.cache.keys().next().value!);
+      }),
+    );
+    const found = copies.filter((c): c is TranscriptCopy => c !== null).sort((a, b) => b.mtimeMs - a.mtimeMs);
+    if (found.length < entry.files.length) this.cache.delete(sessionId); // search again next time
     return found;
+  }
+
+  /** The live copy (most recently written), or null. */
+  async locate(projectsDir: string, sessionId: string, cwd: string | undefined, now: number): Promise<string | null> {
+    return (await this.locateAll(projectsDir, sessionId, cwd, now))[0]?.file ?? null;
+  }
+
+  private async search(projectsDir: string, sessionId: string, cwd: string | undefined): Promise<string[]> {
+    const name = `${sessionId}.jsonl`;
+    let dirs: string[] = [];
+    try {
+      dirs = await readdir(projectsDir);
+    } catch {
+      dirs = [];
+    }
+    // The cwd's folder first (the usual place), then every other one.
+    const first = cwd ? projectSlug(cwd) : null;
+    const ordered = first ? [first, ...dirs.filter((d) => d !== first)] : dirs;
+    const hits = await Promise.all(
+      ordered.map(async (dir) => {
+        const candidate = path.join(projectsDir, dir, name);
+        return (await exists(candidate)) ? candidate : null;
+      }),
+    );
+    return hits.filter((file): file is string => file !== null);
   }
 }
 
