@@ -1,3 +1,4 @@
+import { msg, type Message, type MessageParams } from '../../shared/i18n';
 import type { SessionVerdict, Settings, TranscriptState } from '../../shared/types';
 import type { ProcInfo } from './processes';
 import type { PendingTool } from './transcript';
@@ -95,7 +96,7 @@ export interface EvaluateInput extends SessionActivity {
 export interface Evaluation {
   verdict: SessionVerdict;
   blocksShutdown: boolean;
-  reason: string;
+  reason: Message;
   /** The verdict can only be settled with a process snapshot. */
   needsProcessCheck: boolean;
 }
@@ -112,16 +113,17 @@ const CHILD_TIME_SLACK_MS = 2_000;
 /** Helper CPU can stretch the silence rule of a busy turn, but only this far. */
 export const HELPER_EXTENSION_MAX_MS = 3 * 60 * MIN;
 
-/** Tools that always wait for the user. */
-const QUESTION_TOOLS: Record<string, string> = { AskUserQuestion: 'ตอบคำถาม', ExitPlanMode: 'อนุมัติแผน' };
+/** Tools that always wait for the user (value: what they wait for, a "what.<value>" text). */
+const QUESTION_TOOLS: Record<string, string> = { AskUserQuestion: 'question', ExitPlanMode: 'plan' };
 /** Tools that start a shell once allowed: no shell after the grace period = permission prompt. */
 const SHELL_TOOLS = new Set(['Bash', 'PowerShell']);
 /** Tools that finish within seconds once allowed: still pending after the grace period = permission prompt. */
 const INSTANT_TOOLS = new Set(['Edit', 'Write', 'MultiEdit', 'NotebookEdit', 'Read', 'Grep', 'Glob']);
-const WAITING_FOR_TEXT: Record<string, string> = {
-  'dialog open': 'ตอบหน้าต่างที่เปิดค้าง',
-  'sandbox request': 'อนุญาต sandbox',
-  'goal proposal': 'อนุมัติเป้าหมาย',
+/** Claude Code's waitingFor values → "what.<value>" texts. */
+const WAITING_FOR: Record<string, string> = {
+  'dialog open': 'dialog',
+  'sandbox request': 'sandbox',
+  'goal proposal': 'goal',
 };
 
 export function maxOf(...values: Array<number | null | undefined>): number | null {
@@ -132,36 +134,32 @@ export function maxOf(...values: Array<number | null | undefined>): number | nul
   return max;
 }
 
-function quietText(ms: number): string {
-  if (!Number.isFinite(ms)) return 'นานแล้ว';
-  const minutes = Math.floor(ms / MIN);
-  return minutes >= 60 ? `${Math.floor(minutes / 60)} ชม. ${minutes % 60} นาที` : `${minutes} นาที`;
-}
-
-const clockText = (ms: number): string => new Date(ms).toTimeString().slice(0, 5);
 const toolNames = (tools: readonly ProcInfo[]): string => [...new Set(tools.map((p) => p.name))].join(', ');
 
-const result = (verdict: SessionVerdict, blocksShutdown: boolean, reason: string, needsProcessCheck = false): Evaluation => ({
+const result = (verdict: SessionVerdict, blocksShutdown: boolean, reason: Message, needsProcessCheck = false): Evaluation => ({
   verdict,
   blocksShutdown,
   reason,
   needsProcessCheck,
 });
 
-type Waiting = { since: number; what: string } | 'check' | null;
+/** `what` holds the params of a "what.<value>" text: {what: 'permission', tool: 'Bash'}. */
+type Waiting = { since: number; what: MessageParams } | 'check' | null;
+
+const waitingForWhat = (value: string): MessageParams => (WAITING_FOR[value] ? { what: WAITING_FOR[value] } : { what: 'other', value });
 
 /** Is the session waiting for the user? 'check' = only a process snapshot can tell. */
 function detectWaiting(input: EvaluateInput, busy: boolean, latest: number | null, toolsRunning: boolean | null): Waiting {
   const { file, now, processes } = input;
-  if (file.waitingFor !== undefined) return { since: latest ?? now, what: WAITING_FOR_TEXT[file.waitingFor] ?? file.waitingFor };
+  if (file.waitingFor !== undefined) return { since: latest ?? now, what: waitingForWhat(file.waitingFor) };
   if (!busy) return null;
   let needsCheck = false;
   for (const tool of input.pendingTools) {
     const at = tool.at ?? latest ?? now;
     const question = QUESTION_TOOLS[tool.name];
-    if (question) return { since: at, what: question };
+    if (question) return { since: at, what: { what: question } };
     if (now - at < PERMISSION_GRACE_MS) continue;
-    if (INSTANT_TOOLS.has(tool.name)) return { since: at, what: `อนุญาตให้ใช้ ${tool.name}` };
+    if (INSTANT_TOOLS.has(tool.name)) return { since: at, what: { what: 'permission', tool: tool.name } };
     if (SHELL_TOOLS.has(tool.name)) {
       if (processes === null || toolsRunning === null) {
         needsCheck = true;
@@ -171,7 +169,7 @@ function detectWaiting(input: EvaluateInput, busy: boolean, latest: number | nul
       // without a known marker) or any helper activity means it is running, not waiting.
       const newest = processes.newestChildAt ?? null;
       const startedSince = newest !== null && newest >= at - CHILD_TIME_SLACK_MS;
-      if (!toolsRunning && !startedSince && processes.helpersActiveNow !== true) return { since: at, what: `อนุญาตให้ใช้ ${tool.name}` };
+      if (!toolsRunning && !startedSince && processes.helpersActiveNow !== true) return { since: at, what: { what: 'permission', tool: tool.name } };
     }
   }
   return needsCheck ? 'check' : null;
@@ -191,7 +189,7 @@ export function evaluateSession(input: EvaluateInput): Evaluation {
   let hung: ProcInfo[] = [];
   if (processes && processes.tools.length > 0) {
     const idleMs = now - (processes.toolsActiveAt ?? now);
-    if (toolStallMs <= 0 || idleMs < toolStallMs) return result('tool', true, `กำลังรันคำสั่ง (${toolNames(processes.tools)})`);
+    if (toolStallMs <= 0 || idleMs < toolStallMs) return result('tool', true, msg('reason.tool', { names: toolNames(processes.tools) }));
     hung = processes.tools; // no CPU, I/O, output or process changes for too long
   }
 
@@ -200,7 +198,7 @@ export function evaluateSession(input: EvaluateInput): Evaluation {
   // under the session; with nothing to measure, fall back to the long-silence rule.
   let shellHungMs: number | null = null;
   if (file.status === 'shell' && (processes === null || processes.tools.length === 0)) {
-    const reason = 'Claude บอกว่ายังมี shell รันอยู่';
+    const reason = msg('reason.shellRunning');
     if (processes === null) return result('tool', true, reason, true);
     const activeAt = processes.shellActiveAt ?? null;
     if (activeAt !== null) {
@@ -215,12 +213,12 @@ export function evaluateSession(input: EvaluateInput): Evaluation {
 
   // 2. Waiting for the user (permission prompt, question, dialog): finished after waitingMinutes.
   const waiting = detectWaiting(input, busy, latest, toolsRunning);
-  if (waiting === 'check') return result('working', true, 'กำลังตรวจว่ารอการอนุญาตอยู่หรือไม่', true);
+  if (waiting === 'check') return result('working', true, msg('reason.checkingPermission'), true);
   const waitMs = settings.waitingMinutes * MIN;
   if (waiting && waitMs > 0) {
     return now - waiting.since >= waitMs
-      ? result('stalled', false, `รอ${waiting.what}เกิน ${quietText(waitMs)} จึงนับว่าเสร็จ`)
-      : result('waiting', true, `รอผู้ใช้${waiting.what}`);
+      ? result('stalled', false, msg('reason.waitedTooLong', { ...waiting.what, ms: waitMs }))
+      : result('waiting', true, msg('reason.waiting', waiting.what));
   }
 
   const helperBusy =
@@ -231,39 +229,35 @@ export function evaluateSession(input: EvaluateInput): Evaluation {
   if (busy || waiting) {
     if (stalledMs > 0 && quietMs >= stalledMs) {
       if (processes === null) {
-        return result(waiting ? 'waiting' : 'working', true, `เงียบมา ${quietText(quietMs)} กำลังตรวจ process เพื่อยืนยัน`, true);
+        return result(waiting ? 'waiting' : 'working', true, msg('reason.quietChecking', { ms: quietMs }), true);
       }
       if (!helperBusy || quietMs >= HELPER_EXTENSION_MAX_MS) {
-        return result('stalled', false, `ไม่มีความเคลื่อนไหว ${quietText(quietMs)} จึงนับว่าเสร็จ`);
+        return result('stalled', false, msg('reason.quietFinished', { ms: quietMs }));
       }
     }
-    if (waiting) return result('waiting', true, `รอผู้ใช้${waiting.what}`);
-    return result(
-      'working',
-      true,
-      file.status !== undefined ? 'Claude กำลังทำงาน' : 'ไฟล์สถานะไม่มีฟิลด์ status และ transcript ยังไม่จบ turn',
-    );
+    if (waiting) return result('waiting', true, msg('reason.waiting', waiting.what));
+    return result('working', true, msg(file.status !== undefined ? 'reason.working' : 'reason.workingNoStatus'));
   }
 
   // 4. Turn over: is anything still going on in the background?
   if (input.scheduledWakeAt !== null && now < input.scheduledWakeAt + WAKE_GRACE_MS) {
-    return result('scheduled', true, `ตั้งเวลาทำต่อตอน ${clockText(input.scheduledWakeAt)}`);
+    return result('scheduled', true, msg('reason.scheduled', { at: input.scheduledWakeAt }));
   }
   if (input.runningSubagentAt !== null && (stalledMs <= 0 || now - input.runningSubagentAt < stalledMs)) {
-    return result('background', true, 'subagent ยังทำงานอยู่');
+    return result('background', true, msg('reason.subagent'));
   }
   if (input.sideActivityAt !== null && now - input.sideActivityAt < SIDE_ACTIVITY_WINDOW_MS) {
-    return result('background', true, 'มี subagent หรือไฟล์ของ session ถูกเขียนเมื่อไม่นานนี้');
+    return result('background', true, msg('reason.sideActivity'));
   }
   // Helper CPU after the turn (headless browser, busy MCP server...) counts only for a while.
   const turnOverForMs = now - (file.statusUpdatedAt ?? latest ?? now);
   if (helperBusy && (toolStallMs <= 0 || turnOverForMs < toolStallMs)) {
-    return result('background', true, `process เบื้องหลังใช้ CPU ${processes!.helperCpuPercent!.toFixed(1)}%`);
+    return result('background', true, msg('reason.helperCpu', { cpu: processes!.helperCpuPercent!.toFixed(1) }));
   }
   if (hung.length > 0) {
     const idleMs = now - (processes!.toolsActiveAt ?? now);
-    return result('stalled', false, `คำสั่งเบื้องหลังไม่ขยับมา ${quietText(idleMs)} จึงนับว่าค้าง (${toolNames(hung)})`);
+    return result('stalled', false, msg('reason.toolHung', { ms: idleMs, names: toolNames(hung) }));
   }
-  if (shellHungMs !== null) return result('stalled', false, `shell ที่ Claude เปิดไว้ไม่ขยับมา ${quietText(shellHungMs)} จึงนับว่าค้าง`);
-  return result('idle', false, processes ? 'ว่าง' : 'ว่าง (ยังไม่ได้ตรวจ process เบื้องหลัง)');
+  if (shellHungMs !== null) return result('stalled', false, msg('reason.shellHung', { ms: shellHungMs }));
+  return result('idle', false, msg(processes ? 'reason.idle' : 'reason.idleUnchecked'));
 }

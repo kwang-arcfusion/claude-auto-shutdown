@@ -5,7 +5,7 @@ import path from 'node:path';
 import { test } from 'node:test';
 import { buildActionCommand } from '../src/main/actions';
 import { loadSettings, saveSettings } from '../src/main/storage';
-import { DEFAULT_SETTINGS, formatMinutes, sanitizeSettings } from '../src/shared/settings';
+import { DEFAULT_SETTINGS, sanitizeSettings } from '../src/shared/settings';
 
 test('sanitizeSettings clamps numbers and falls back on invalid values', () => {
   const s = sanitizeSettings({
@@ -25,6 +25,10 @@ test('sanitizeSettings clamps numbers and falls back on invalid values', () => {
   assert.equal(s.dryRun, false);
   assert.equal(s.claudeDir, 'D:\\claude');
   assert.deepEqual(sanitizeSettings(null), { ...DEFAULT_SETTINGS });
+  assert.equal(DEFAULT_SETTINGS.language, 'en');
+  assert.equal(sanitizeSettings({ language: 'th' }).language, 'th');
+  assert.equal(sanitizeSettings({ language: 'fr' }).language, 'en');
+  assert.equal(sanitizeSettings({ language: 'fr' }, { ...DEFAULT_SETTINGS, language: 'th' }).language, 'th');
 });
 
 test('a bad value in a patch keeps the current value', () => {
@@ -54,10 +58,4 @@ test('the shutdown command forces apps closed only when asked', () => {
   assert.match(sleep.file, /powershell\.exe$/i);
   assert.match(sleep.args.join(' '), /SetSuspendState/);
   assert.match(sleep.args.join(' '), /exit 1/); // a failed sleep must not look like success
-});
-
-test('formatMinutes', () => {
-  assert.equal(formatMinutes(10), '10 นาที');
-  assert.equal(formatMinutes(0.5), '30 วินาที');
-  assert.equal(formatMinutes(2.5), '2.5 นาที');
 });

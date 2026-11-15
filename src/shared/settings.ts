@@ -1,3 +1,4 @@
+import { isLanguage } from './i18n';
 import type { ActionKind, Settings } from './types';
 
 export const DEFAULT_SETTINGS: Readonly<Settings> = Object.freeze({
@@ -14,6 +15,7 @@ export const DEFAULT_SETTINGS: Readonly<Settings> = Object.freeze({
   preventSleepWhileArmed: true,
   backgroundCpuPercent: 5,
   claudeDir: '',
+  language: 'en',
 });
 
 export const LIMITS = {
@@ -58,17 +60,6 @@ export function sanitizeSettings(raw: unknown, base: Readonly<Settings> = DEFAUL
     preventSleepWhileArmed: bool(r.preventSleepWhileArmed, base.preventSleepWhileArmed),
     backgroundCpuPercent: clampNumber(r.backgroundCpuPercent, base.backgroundCpuPercent, LIMITS.backgroundCpuPercent),
     claudeDir: typeof r.claudeDir === 'string' ? r.claudeDir.trim() : base.claudeDir,
+    language: isLanguage(r.language) ? r.language : base.language,
   };
-}
-
-export const ACTION_LABEL: Record<ActionKind, string> = {
-  shutdown: 'ปิดเครื่อง',
-  hibernate: 'Hibernate',
-  sleep: 'Sleep',
-};
-
-/** Formats a number of minutes for log messages, e.g. "10 นาที" or "30 วินาที". */
-export function formatMinutes(minutes: number): string {
-  if (minutes > 0 && minutes < 1) return `${Math.round(minutes * 60)} วินาที`;
-  return `${Number.isInteger(minutes) ? minutes : minutes.toFixed(1)} นาที`;
 }

@@ -6,6 +6,7 @@ import { test } from 'node:test';
 import { ClaudeDetector } from '../src/main/detector/claude';
 import type { ProcInfo, ProcessSnapshot, SnapshotSource } from '../src/main/detector/processes';
 import { msToFiletime } from '../src/main/detector/tree';
+import { render } from '../src/shared/i18n';
 import { DEFAULT_SETTINGS } from '../src/shared/settings';
 import type { DetectionResult } from '../src/shared/types';
 
@@ -160,7 +161,7 @@ test('a live session whose process identity does not add up keeps the PC on (nev
   const dir = claudeDir([{ pid: 11, sessionId: 'a', status: 'idle', procStart: '5000', statusUpdatedAt: Date.now() }]);
   const r = await detector(dir, new FakeSnapshotter(() => [claudeProc(11, 99_000_000_000)]), [11]).detect(settings);
   assert.equal(r.aggregate, 'busy');
-  assert.match(r.sessions[0]!.reason, /ยืนยันไม่ได้/);
+  assert.equal(r.sessions[0]!.reason.code, 'reason.identityUnsure');
 });
 
 test('status "shell" with a shell we do not recognise: judged by its I/O, then hung once it is quiet', async () => {
@@ -184,7 +185,8 @@ test('status "shell" with a shell we do not recognise: judged by its I/O, then h
 test('a missing sessions folder gives unknown', async () => {
   const r = await detector(path.join(os.tmpdir(), 'cas-does-not-exist-123'), new FakeSnapshotter(() => []), []).detect(settings);
   assert.equal(r.aggregate, 'unknown');
-  assert.match(r.error ?? '', /ไม่พบโฟลเดอร์/);
+  assert.equal(r.error?.code, 'error.noSessionsDir');
+  assert.match(render('en', r.error!), /Folder not found: .*cas-does-not-exist-123/);
 });
 
 test('a failing process snapshot gives unknown, never idle', async () => {
@@ -196,7 +198,8 @@ test('a failing process snapshot gives unknown, never idle', async () => {
   };
   const r = await detector(dir, failing, [11]).detect(settings);
   assert.equal(r.aggregate, 'unknown');
-  assert.match(r.error ?? '', /timed out/);
+  assert.equal(r.error?.code, 'error.snapshot');
+  assert.match(render('en', r.error!), /^Cannot read the process list: powershell timed out/);
 });
 
 test('an unreadable session file for a live process gives unknown', async () => {

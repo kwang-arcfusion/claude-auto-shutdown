@@ -1,5 +1,5 @@
 import type { Api } from '../shared/api';
-import { ACTION_LABEL, formatMinutes } from '../shared/settings';
+import { formatAgo, render, renderEntry, translate, type Language, type MessageCode, type MessageParams } from '../shared/i18n';
 import type { AppState, LogEntry, SessionInfo, SessionVerdict, Settings } from '../shared/types';
 
 const api = (window as unknown as { api?: Api }).api;
@@ -32,14 +32,14 @@ const ui = {
 };
 
 /** Short status words; the full reason is in the row's tooltip. */
-const VERDICT: Record<SessionVerdict, { label: string; tone: string }> = {
-  working: { label: 'ทำงาน', tone: 'busy' },
-  tool: { label: 'รันคำสั่ง', tone: 'busy' },
-  background: { label: 'เบื้องหลัง', tone: 'busy' },
-  waiting: { label: 'รอตอบ', tone: 'warn' },
-  scheduled: { label: 'ตั้งเวลาไว้', tone: 'busy' },
-  stalled: { label: 'ค้าง', tone: 'idle' },
-  idle: { label: 'ว่าง', tone: 'idle' },
+const VERDICT: Record<SessionVerdict, { code: MessageCode; tone: string }> = {
+  working: { code: 'verdict.working', tone: 'busy' },
+  tool: { code: 'verdict.tool', tone: 'busy' },
+  background: { code: 'verdict.background', tone: 'busy' },
+  waiting: { code: 'verdict.waiting', tone: 'warn' },
+  scheduled: { code: 'verdict.scheduled', tone: 'busy' },
+  stalled: { code: 'verdict.stalled', tone: 'idle' },
+  idle: { code: 'verdict.idle', tone: 'idle' },
 };
 
 const NUMBER_FIELDS = [
@@ -54,9 +54,13 @@ const NUMBER_FIELDS = [
 const BOOLEAN_FIELDS = ['forceCloseApps', 'cancelOnUserActivity', 'preventSleepWhileArmed', 'dryRun'] as const;
 
 let state: AppState | null = null;
+let lang: Language = 'en';
+let staticLang: Language | null = null;
 let primaryAction: (() => void) | null = null;
 let renderedLogKey = '';
 let savedTimer: ReturnType<typeof setTimeout> | null = null;
+
+const t = (code: MessageCode, params?: MessageParams): string => translate(lang, code, params);
 
 const pad = (n: number): string => String(n).padStart(2, '0');
 
@@ -68,15 +72,7 @@ function clock(ms: number): string {
   return h > 0 ? `${h}:${pad(m)}:${pad(s)}` : `${pad(m)}:${pad(s)}`;
 }
 
-function agoShort(timestamp: number | null): string {
-  if (!timestamp) return '';
-  const seconds = Math.max(0, Math.round((Date.now() - timestamp) / 1000));
-  if (seconds < 10) return 'เมื่อกี้';
-  if (seconds < 60) return `${seconds} วิ`;
-  const minutes = Math.floor(seconds / 60);
-  if (minutes < 60) return `${minutes} นาที`;
-  return `${Math.floor(minutes / 60)} ชม.`;
-}
+const ago = (timestamp: number | null): string => (timestamp ? formatAgo(lang, Date.now() - timestamp) : '');
 
 function timeOf(timestamp: number): string {
   const date = new Date(timestamp);
@@ -90,9 +86,21 @@ function field<T extends HTMLInputElement | HTMLSelectElement>(name: string): T 
   return ui.form.elements.namedItem(name) as T;
 }
 
+/** Fixed texts of the page (data-i18n, data-i18n-title, data-i18n-aria), in the selected language. */
+function applyStaticText(): void {
+  if (staticLang === lang) return;
+  staticLang = lang;
+  document.documentElement.lang = lang;
+  for (const node of document.querySelectorAll<HTMLElement>('[data-i18n]')) node.textContent = t(node.dataset.i18n as MessageCode);
+  for (const node of document.querySelectorAll<HTMLElement>('[data-i18n-title]')) node.title = t(node.dataset.i18nTitle as MessageCode);
+  for (const node of document.querySelectorAll<HTMLElement>('[data-i18n-aria]')) {
+    node.setAttribute('aria-label', t(node.dataset.i18nAria as MessageCode));
+  }
+}
+
 function renderHero(s: AppState): void {
   const now = Date.now();
-  const action = ACTION_LABEL[s.settings.action];
+  const action = s.settings.action;
   let tone = 'off';
   let label = '';
   let sub = '';
@@ -102,47 +110,47 @@ function renderHero(s: AppState): void {
 
   switch (s.phase) {
     case 'disarmed':
-      label = 'ยังไม่ได้เริ่มเฝ้า';
-      sub = `ว่าง ${formatMinutes(s.settings.idleConfirmMinutes)} → นับ ${formatMinutes(s.settings.countdownMinutes)} → ${action}`;
-      button = { text: 'เริ่มเฝ้า', kind: 'primary', run: () => void api?.arm() };
+      label = t('ui.notWatching');
+      sub = t('ui.flow', { idle: s.settings.idleConfirmMinutes, countdown: s.settings.countdownMinutes, action });
+      button = { text: t('ui.start'), kind: 'primary', run: () => void api?.arm() };
       break;
     case 'monitoring':
       if (s.idleSince !== null) {
         const confirmMs = s.settings.idleConfirmMinutes * 60_000;
         tone = 'confirm';
-        label = 'Claude ว่างแล้ว';
+        label = t('ui.claudeIdle');
         timer = clock(s.idleSince + confirmMs - now);
         progress = confirmMs > 0 ? (now - s.idleSince) / confirmMs : 1;
-        sub = 'ยืนยันก่อนเริ่มนับถอยหลัง';
+        sub = t('ui.confirming');
       } else {
         const detection = s.lastDetection;
         const working = detection?.sessions.filter((x) => x.blocksShutdown).length ?? 0;
         tone = 'busy';
-        label = 'กำลังเฝ้า';
+        label = t('ui.watching');
         sub =
           detection?.aggregate === 'unknown'
-            ? 'ตรวจสถานะไม่ได้'
+            ? t('ui.statusUnknown')
             : working > 0
-              ? `Claude ทำงานอยู่ ${working} session`
-              : 'กำลังตรวจ…';
+              ? t('ui.claudeWorking', { count: working })
+              : t('ui.checking');
       }
-      button = { text: 'หยุดเฝ้า', kind: 'ghost', run: () => void api?.disarm() };
+      button = { text: t('ui.stop'), kind: 'ghost', run: () => void api?.disarm() };
       break;
     case 'countdown': {
       const total = s.countdownTotalMs ?? s.settings.countdownMinutes * 60_000;
       const left = (s.countdownEndsAt ?? now) - now;
       tone = 'danger';
-      label = `จะ${action}ใน`;
+      label = t('ui.actingIn', { action });
       timer = clock(left);
       progress = total > 0 ? 1 - left / total : 1;
-      sub = left <= 0 ? 'ตรวจซ้ำรอบสุดท้าย…' : '';
-      button = { text: 'ยกเลิก', kind: 'danger', run: () => void api?.cancel() };
+      sub = left <= 0 ? t('ui.finalCheck') : '';
+      button = { text: t('ui.cancel'), kind: 'danger', run: () => void api?.cancel() };
       break;
     }
     case 'executing':
       // shutdown /t 0 cannot be taken back, so there is nothing to cancel here.
       tone = 'danger';
-      label = s.effectiveDryRun ? 'ทดสอบ: ถึงเวลาแล้ว' : `กำลัง${action}…`;
+      label = s.effectiveDryRun ? t('ui.testTimeUp') : t('ui.acting', { action });
       button = null;
       break;
   }
@@ -168,7 +176,7 @@ function sessionRow(session: SessionInfo): HTMLLIElement {
   const row = document.createElement('li');
   row.className = 'session';
   row.dataset.tone = verdict.tone;
-  row.title = [session.cwd, session.reason, session.lastActivityAt ? `เคลื่อนไหวล่าสุด ${agoShort(session.lastActivityAt)}ที่แล้ว` : '']
+  row.title = [session.cwd, render(lang, session.reason), session.lastActivityAt ? t('ui.lastActive', { ago: ago(session.lastActivityAt) }) : '']
     .filter(Boolean)
     .join('\n');
 
@@ -179,21 +187,21 @@ function sessionRow(session: SessionInfo): HTMLLIElement {
   name.textContent = session.name || basename(session.cwd) || session.sessionId.slice(0, 8);
   const status = document.createElement('span');
   status.className = 'state';
-  status.textContent = verdict.label;
+  status.textContent = t(verdict.code);
   row.append(dot, name, status);
   return row;
 }
 
 function renderLastCheck(s: AppState): void {
   const detection = s.lastDetection;
-  ui.lastCheck.textContent = detection ? agoShort(detection.at) : '';
-  ui.lastCheck.title = detection ? `ตรวจล่าสุด ${timeOf(detection.at)}` : '';
+  ui.lastCheck.textContent = detection ? ago(detection.at) : '';
+  ui.lastCheck.title = detection ? t('ui.lastCheckAt', { at: detection.at }) : '';
 }
 
 function renderSessions(s: AppState): void {
   const detection = s.lastDetection;
   ui.detectError.hidden = !detection?.error;
-  ui.detectError.textContent = detection?.error ?? '';
+  ui.detectError.textContent = detection?.error ? render(lang, detection.error) : '';
   const sessions = detection?.sessions ?? [];
   ui.noSessions.hidden = !detection || sessions.length > 0;
   ui.sessionList.replaceChildren(...sessions.map(sessionRow));
@@ -204,15 +212,16 @@ function logRow(entry: LogEntry): HTMLLIElement {
   row.className = entry.level;
   const time = document.createElement('time');
   time.textContent = timeOf(entry.at);
-  time.title = new Date(entry.at).toLocaleString('th-TH');
+  time.title = new Date(entry.at).toLocaleString(lang === 'th' ? 'th-TH' : 'en-GB');
   const message = document.createElement('span');
-  message.textContent = entry.message;
+  message.textContent = renderEntry(lang, entry);
   row.append(time, message);
   return row;
 }
 
 function renderLog(s: AppState): void {
-  const key = `${s.log.length}:${s.log[0]?.at ?? 0}:${s.log[0]?.message ?? ''}`;
+  const newest = s.log[0];
+  const key = `${lang}:${s.log.length}:${newest?.at ?? 0}:${newest?.code ?? newest?.message ?? ''}`;
   if (key === renderedLogKey) return;
   renderedLogKey = key;
   ui.logList.replaceChildren(...s.log.map(logRow));
@@ -225,9 +234,12 @@ function fillSettings(s: AppState): void {
   }
   for (const key of BOOLEAN_FIELDS) field<HTMLInputElement>(key).checked = s.settings[key];
 
+  const language = field<HTMLSelectElement>('language');
+  if (document.activeElement !== language) language.value = s.settings.language;
+
   const action = field<HTMLSelectElement>('action');
   if (document.activeElement !== action) action.value = s.settings.action;
-  action.title = `คำสั่ง: ${s.actionCommand}`;
+  action.title = t('ui.command', { command: s.actionCommand });
 
   const dir = field<HTMLInputElement>('claudeDir');
   if (document.activeElement !== dir) dir.value = s.settings.claudeDir;
@@ -236,7 +248,9 @@ function fillSettings(s: AppState): void {
   const dryRun = field<HTMLInputElement>('dryRun');
   dryRun.disabled = s.dryRunForced;
   if (s.dryRunForced) dryRun.checked = true;
-  dryRun.closest('.row')?.classList.toggle('disabled', s.dryRunForced);
+  const dryRow = dryRun.closest<HTMLElement>('.row');
+  dryRow?.classList.toggle('disabled', s.dryRunForced);
+  if (dryRow) dryRow.title = t(s.dryRunForced ? 'ui.dryForced' : 'set.dryRunTip');
 
   const force = field<HTMLInputElement>('forceCloseApps');
   force.disabled = s.settings.action !== 'shutdown';
@@ -253,6 +267,8 @@ function tick(): void {
 /** On new state from the main process: everything, including the session list and the log. */
 function applyState(next: AppState): void {
   state = next;
+  lang = next.settings.language;
+  applyStaticText();
   fillSettings(next);
   renderLog(next);
   renderSessions(next);
@@ -269,7 +285,7 @@ function flashSaved(): void {
 }
 
 if (!api) {
-  ui.phaseLabel.textContent = 'ไม่พบ preload API';
+  ui.phaseLabel.textContent = t('ui.noPreload');
 } else {
   const bridge = api;
   void bridge.getState().then(applyState);

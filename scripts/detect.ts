@@ -3,6 +3,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { ClaudeDetector, defaultClaudeDir } from '../src/main/detector/claude';
 import { PowerShellSnapshotter } from '../src/main/detector/processes';
+import { render } from '../src/shared/i18n';
 import { DEFAULT_SETTINGS } from '../src/shared/settings';
 
 void (async () => {
@@ -15,7 +16,7 @@ void (async () => {
   console.log(
     `aggregate=${result.aggregate} durationMs=${result.durationMs} processSnapshot=${result.usedProcessSnapshot} dir=${result.claudeDir}`,
   );
-  if (result.error) console.log(`error: ${result.error}`);
+  if (result.error) console.log(`error: ${render('en', result.error)}`);
   console.table(
     result.sessions.map((s) => ({
       pid: s.pid,
@@ -29,7 +30,7 @@ void (async () => {
       lastActivity: s.lastActivityAt ? new Date(s.lastActivityAt).toLocaleTimeString() : '',
     })),
   );
-  for (const s of result.sessions) console.log(`${s.pid}: ${s.reason}`);
+  for (const s of result.sessions) console.log(`${s.pid}: ${render('en', s.reason)}`);
 })().catch((error: unknown) => {
   console.error(error);
   process.exit(1);

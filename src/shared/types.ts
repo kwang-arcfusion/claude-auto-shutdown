@@ -1,3 +1,5 @@
+import type { Language, Message, MessageParams } from './i18n';
+
 export type ActionKind = 'shutdown' | 'hibernate' | 'sleep';
 
 export interface Settings {
@@ -26,6 +28,8 @@ export interface Settings {
   backgroundCpuPercent: number;
   /** Claude config folder. Empty means CLAUDE_CONFIG_DIR or ~/.claude. */
   claudeDir: string;
+  /** Language of the window, tray, notifications and log. */
+  language: Language;
 }
 
 export type TranscriptState = 'ended' | 'running' | 'unknown';
@@ -56,7 +60,7 @@ export interface SessionInfo {
   verdict: SessionVerdict;
   /** True when this session keeps the machine on. */
   blocksShutdown: boolean;
-  reason: string;
+  reason: Message;
   lastActivityAt: number | null;
   transcriptState: TranscriptState;
   /** Names of running tool processes; empty when processes were not inspected. */
@@ -73,7 +77,7 @@ export interface DetectionResult {
   aggregate: Aggregate;
   sessions: SessionInfo[];
   /** Set when detection could not be completed; the aggregate is then not 'idle'. */
-  error: string | null;
+  error: Message | null;
   claudeDir: string;
   usedProcessSnapshot: boolean;
   /** Processes were not inspected (display-only check): an 'idle' aggregate is unverified. */
@@ -88,7 +92,11 @@ export type LogLevel = 'info' | 'warn' | 'error';
 export interface LogEntry {
   at: number;
   level: LogLevel;
-  message: string;
+  /** Message code, shown in the selected language. Missing on entries saved by older versions. */
+  code?: string;
+  params?: MessageParams;
+  /** Plain text of entries saved by older versions (they have no code). */
+  message?: string;
 }
 
 export interface AppState {

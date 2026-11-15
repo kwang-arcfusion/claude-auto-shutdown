@@ -61,7 +61,7 @@ export class KeepAwake {
     child.on('exit', (code) => {
       if (this.child !== child) return; // stopped on purpose
       this.child = null;
-      this.onError(`ตัวกันเครื่อง sleep หยุดทำงาน (code ${code ?? '?'}) ${stderr.trim().slice(0, 200)}`.trim());
+      this.onError(`exit code ${code ?? '?'} ${stderr.trim().slice(0, 200)}`.trim());
     });
     this.child = child;
   }

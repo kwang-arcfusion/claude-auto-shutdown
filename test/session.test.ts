@@ -3,7 +3,10 @@ import { test } from 'node:test';
 import type { ProcInfo } from '../src/main/detector/processes';
 import { evaluateSession, parseSessionFile, type EvaluateInput, type ProcessFacts, type SessionFile } from '../src/main/detector/session';
 import type { PendingTool } from '../src/main/detector/transcript';
+import { render, type Message } from '../src/shared/i18n';
 import { DEFAULT_SETTINGS } from '../src/shared/settings';
+
+const text = (message: Message): string => render('en', message);
 
 const NOW = 1_800_000_000_000;
 const MIN = 60_000;
@@ -83,7 +86,7 @@ test('an active tool shell blocks, also when the turn is over (background task, 
     const r = evaluateSession(input({ status }, { processes: facts({ tools: [proc('bash.exe')], toolsActiveAt: NOW - MIN }) }));
     assert.equal(r.verdict, 'tool', status);
     assert.equal(r.blocksShutdown, true, status);
-    assert.match(r.reason, /bash\.exe/);
+    assert.match(text(r.reason), /bash\.exe/);
   }
 });
 
@@ -99,7 +102,7 @@ test('a background command with no activity for toolStallMinutes counts as hung'
   const idle = evaluateSession(input({ status: 'idle' }, { processes: hung }));
   assert.equal(idle.verdict, 'stalled');
   assert.equal(idle.blocksShutdown, false);
-  assert.match(idle.reason, /node\.exe/);
+  assert.match(text(idle.reason), /node\.exe/);
 
   // A turn still writing to its transcript keeps working, even with a hung command around.
   assert.equal(evaluateSession(input({ status: 'busy' }, { processes: hung })).verdict, 'working');
@@ -115,21 +118,24 @@ test('a question to the user waits, then counts as finished after waitingMinutes
   const recent = evaluateSession(input({ status: 'busy' }, { pendingTools: [pending('AskUserQuestion', 2 * MIN)] }));
   assert.equal(recent.verdict, 'waiting');
   assert.equal(recent.blocksShutdown, true);
-  assert.match(recent.reason, /ตอบคำถาม/);
+  assert.equal(text(recent.reason), 'Waiting for you to answer a question');
+  assert.equal(render('th', recent.reason), 'รอผู้ใช้ตอบคำถาม');
 
   const late = evaluateSession(input({ status: 'busy' }, { pendingTools: [pending('AskUserQuestion', 5 * MIN)] }));
   assert.equal(late.verdict, 'stalled');
   assert.equal(late.blocksShutdown, false);
+  assert.equal(text(late.reason), 'Waited over 5 min for you to answer a question, so it counts as finished');
 
   const plan = evaluateSession(input({ status: 'busy' }, { pendingTools: [pending('ExitPlanMode', MIN)] }));
-  assert.match(plan.reason, /อนุมัติแผน/);
+  assert.match(text(plan.reason), /approve a plan/);
 });
 
 test('a Bash call with no shell after the grace period is a permission prompt', () => {
   const bash = [pending('Bash', 3 * MIN)];
   const prompt = evaluateSession(input({ status: 'busy' }, { pendingTools: bash }));
   assert.equal(prompt.verdict, 'waiting');
-  assert.match(prompt.reason, /อนุญาตให้ใช้ Bash/);
+  assert.match(text(prompt.reason), /allow Bash/);
+  assert.match(render('th', prompt.reason), /อนุญาตให้ใช้ Bash/);
 
   // The shell is running: the command was allowed and is doing its job.
   const running = evaluateSession(input({ status: 'busy' }, { pendingTools: bash, processes: facts({ tools: [proc('bash.exe')], toolsActiveAt: NOW }) }));
@@ -161,6 +167,7 @@ test("Claude Code's own dialogs (waitingFor) wait, then count as finished after 
   const late = evaluateSession(input({ status: 'idle', waitingFor: 'dialog open' }, { lastActivityAt: NOW - 6 * MIN }));
   assert.equal(late.verdict, 'stalled');
   assert.equal(late.blocksShutdown, false);
+  assert.equal(text(late.reason), 'Waited over 5 min for you to answer an open dialog, so it counts as finished');
 });
 
 test('with waitingMinutes = 0 an unanswered prompt falls back to the long silence rule', () => {

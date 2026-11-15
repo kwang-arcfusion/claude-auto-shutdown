@@ -1,6 +1,7 @@
 import { readdir, readFile, stat } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
+import { msg, type Message } from '../../shared/i18n';
 import type { Aggregate, DetectionResult, SessionInfo, Settings } from '../../shared/types';
 import { ActivitySampler, procKey, type ProcActivity, type ProcInfo, type ProcessSnapshot, type SnapshotSource } from './processes';
 import {
@@ -90,7 +91,7 @@ function toInfo(file: SessionFile, activity: SessionActivity, evaluation: Evalua
   };
 }
 
-function aggregateOf(sessions: readonly SessionInfo[], error: string | null): Aggregate {
+function aggregateOf(sessions: readonly SessionInfo[], error: Message | null): Aggregate {
   if (sessions.some((s) => s.blocksShutdown)) return 'busy';
   return error ? 'unknown' : 'idle';
 }
@@ -134,7 +135,7 @@ export class ClaudeDetector implements Detector {
   async detect(settings: Settings, detectOptions: DetectOptions = {}): Promise<DetectionResult> {
     const startedAt = this.now();
     const claudeDir = this.options.claudeDir();
-    const finish = (aggregate: Aggregate, sessions: SessionInfo[], error: string | null, usedProcessSnapshot: boolean) => ({
+    const finish = (aggregate: Aggregate, sessions: SessionInfo[], error: Message | null, usedProcessSnapshot: boolean) => ({
       at: startedAt,
       aggregate,
       sessions: sortSessions(sessions),
@@ -151,13 +152,13 @@ export class ClaudeDetector implements Detector {
     } catch (error) {
       const missing = (error as NodeJS.ErrnoException).code === 'ENOENT';
       const message = missing
-        ? `ไม่พบโฟลเดอร์ ${sessionsDir} (ตรวจค่า "โฟลเดอร์ Claude" ในหน้าตั้งค่า)`
-        : `อ่านโฟลเดอร์ ${sessionsDir} ไม่ได้: ${(error as Error).message}`;
+        ? msg('error.noSessionsDir', { dir: sessionsDir })
+        : msg('error.readSessionsDir', { dir: sessionsDir, detail: (error as Error).message });
       return finish('unknown', [], message, false);
     }
 
     const { files, unreadableLive } = await this.loadSessionFiles(sessionsDir, names);
-    const fileError = unreadableLive > 0 ? `อ่านไฟล์สถานะของ session ที่ยังเปิดอยู่ไม่ได้ ${unreadableLive} ไฟล์` : null;
+    const fileError = unreadableLive > 0 ? msg('error.unreadableSessionFiles', { count: unreadableLive }) : null;
     const live = files.filter((f) => this.pidAlive(f.pid));
     const now = this.now();
     const projectsDir = path.join(claudeDir, 'projects');
@@ -184,7 +185,7 @@ export class ClaudeDetector implements Detector {
       sample = await this.snapshotWithUsage(maxAgeMs, live.map((f) => f.pid));
     } catch (error) {
       const sessions = cheapInfos();
-      return finish(clearlyBusy ? 'busy' : 'unknown', sessions, (error as Error).message, false);
+      return finish(clearlyBusy ? 'busy' : 'unknown', sessions, msg('error.snapshot', { detail: (error as Error).message }), false);
     }
 
     const checkedAt = this.now();
@@ -201,7 +202,7 @@ export class ClaudeDetector implements Detector {
         const unsure: Evaluation = {
           verdict: 'working',
           blocksShutdown: true,
-          reason: 'ยืนยันไม่ได้ว่า process นี้เป็นของ session นี้ จึงยังไม่ปิดเครื่อง',
+          reason: msg('reason.identityUnsure'),
           needsProcessCheck: false,
         };
         sessions.push(toInfo(file, activity[i]!, unsure, null));

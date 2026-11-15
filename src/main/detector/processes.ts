@@ -133,7 +133,7 @@ export class PowerShellSnapshotter implements SnapshotSource {
         (error, out, errOut) => {
           if (error) {
             const detail = String(errOut ?? '').trim().slice(0, 300);
-            reject(new Error(`อ่านรายการ process ไม่ได้: ${error.message}${detail ? ` (${detail})` : ''}`));
+            reject(new Error(`${error.message}${detail ? ` (${detail})` : ''}`));
           } else {
             resolve(out);
           }

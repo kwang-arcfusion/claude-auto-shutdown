@@ -35,14 +35,16 @@ void (async () => {
   // The app writes its event log to SQLite; read it back to prove it was persisted.
   const dbFile = path.join(dir, 'logs.sqlite');
   let messages: string[] = [];
+  let dryRunLogged = false;
   if (existsSync(dbFile)) {
     const db = new DatabaseSync(dbFile);
-    const rows = db.prepare('SELECT at, level, message FROM events ORDER BY id').all() as Array<{ at: number; level: string; message: string }>;
+    const rows = db.prepare('SELECT at, level, message, code FROM events ORDER BY id').all() as Array<{ at: number; level: string; message: string; code: string | null }>;
     messages = rows.map((row) => `${new Date(row.at).toISOString()} [${row.level}] ${row.message}`);
+    dryRunLogged = rows.some((row) => row.code === 'log.dryRunAction' && row.message.includes('[Test mode]'));
     db.close();
   }
   const passed =
-    code === 0 && summary?.phase === 'disarmed' && messages.some((m) => m.includes('[โหมดทดสอบ]')) && existsSync(screenshot);
+    code === 0 && summary?.phase === 'disarmed' && dryRunLogged && existsSync(screenshot);
 
   console.log(messages.join('\n'));
   console.log(`log database: ${dbFile}`);

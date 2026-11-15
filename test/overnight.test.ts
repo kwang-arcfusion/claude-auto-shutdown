@@ -11,6 +11,7 @@ import { ClaudeDetector } from '../src/main/detector/claude';
 import type { ProcInfo, ProcessSnapshot } from '../src/main/detector/processes';
 import { projectSlug } from '../src/main/detector/transcript';
 import { msToFiletime } from '../src/main/detector/tree';
+import { render } from '../src/shared/i18n';
 import { DEFAULT_SETTINGS } from '../src/shared/settings';
 import type { Phase, Settings } from '../src/shared/types';
 
@@ -470,7 +471,7 @@ test('if process inspection breaks, the machine stays on (never guesses idle)', 
   night.expectNoShutdown();
   const last = night.controller.state().lastDetection;
   assert.equal(last?.aggregate, 'unknown');
-  assert.match(last?.error ?? '', /powershell/);
+  assert.match(last?.error ? render('en', last.error) : '', /powershell/);
 });
 
 test('if the Claude process dies mid-turn, its leftover "busy" file is ignored', async () => {

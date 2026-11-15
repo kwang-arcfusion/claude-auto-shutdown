@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { Controller, type ActionResult, type ControllerDeps } from '../src/main/controller';
+import { msg, renderEntry } from '../src/shared/i18n';
 import { DEFAULT_SETTINGS } from '../src/shared/settings';
 import type { Aggregate, LogEntry, Settings } from '../src/shared/types';
 
@@ -29,7 +30,7 @@ function harness(
         at: now,
         aggregate: current,
         sessions: [],
-        error: current === 'unknown' ? 'detector failed' : null,
+        error: current === 'unknown' ? msg('app.checkFailed', { detail: 'detector failed' }) : null,
         claudeDir: 'C:\\claude',
         usedProcessSnapshot: false,
         partial: !thorough && current !== 'busy' ? true : undefined,
@@ -43,7 +44,7 @@ function harness(
     describeAction: () => 'shutdown /s /f /t 0',
     systemIdleSeconds: () => idleSeconds,
     setPreventSleep: (on) => preventSleep.push(on),
-    notify: (title) => notifications.push(title),
+    notify: (title) => notifications.push(title.code),
     saveSettings: () => {
       if (options.saveFails) throw new Error('EBUSY: file is locked');
     },
@@ -231,7 +232,7 @@ test('dry run (setting or --dry-run) logs instead of acting and disarms', async 
     await h.settle();
     assert.deepEqual(h.actions, [true]);
     assert.equal(h.controller.getPhase(), 'disarmed');
-    assert.ok(h.log.some((entry) => entry.message.includes('[โหมดทดสอบ]')));
+    assert.ok(h.log.some((entry) => entry.code === 'log.dryRunAction' && renderEntry('en', entry).includes('[Test mode]')));
   }
 });
 
@@ -242,7 +243,7 @@ test('a failed action disarms and logs an error', async () => {
   h.controller.tick();
   await h.settle();
   assert.equal(h.controller.getPhase(), 'disarmed');
-  assert.ok(h.log.some((entry) => entry.level === 'error' && entry.message.includes('Access is denied.')));
+  assert.ok(h.log.some((entry) => entry.level === 'error' && renderEntry('en', entry).includes('Access is denied.')));
 });
 
 test('cancel during the countdown disarms', async () => {
@@ -265,7 +266,7 @@ test('checks inspect processes only while armed, or when the user asks', async (
   await h.controller.poll(); // disarmed: files only
   h.controller.arm();
   await h.controller.poll(); // armed: thorough
-  h.controller.disarm('test');
+  h.controller.disarm('stop.user');
   await h.controller.poll({ thorough: true }); // "check now" while disarmed
   assert.deepEqual(h.thoroughCalls, [false, true, true]);
 });
@@ -333,7 +334,24 @@ test('a settings file that cannot be saved still applies the change and logs a w
   const s = h.controller.updateSettings({ countdownMinutes: 9 });
   assert.equal(s.countdownMinutes, 9);
   assert.equal(h.controller.getSettings().countdownMinutes, 9);
-  assert.ok(h.log.some((entry) => entry.level === 'warn' && entry.message.includes('EBUSY')));
+  assert.ok(h.log.some((entry) => entry.level === 'warn' && renderEntry('en', entry).includes('EBUSY')));
+});
+
+test('log entries keep their code, so they show in whichever language is selected', () => {
+  const h = harness({ idleConfirmMinutes: 10, countdownMinutes: 20, action: 'hibernate' });
+  h.controller.arm();
+  const armed = h.log.find((entry) => entry.code === 'log.armed');
+  assert.ok(armed);
+  assert.equal(renderEntry('en', armed), 'Watching: once Claude is idle for 10 min, count down 20 min, then hibernate');
+  assert.equal(renderEntry('th', armed), 'เริ่มเฝ้า: เมื่อ Claude ว่างต่อเนื่อง 10 นาที จะนับถอยหลัง 20 นาที แล้วHibernate');
+});
+
+test('reset to defaults keeps the chosen language', () => {
+  const h = harness();
+  h.controller.updateSettings({ language: 'th', countdownMinutes: 9 });
+  const s = h.controller.resetSettings();
+  assert.equal(s.language, 'th');
+  assert.equal(s.countdownMinutes, DEFAULT_SETTINGS.countdownMinutes);
 });
 
 test('updateSettings clamps values and ignores invalid ones', () => {

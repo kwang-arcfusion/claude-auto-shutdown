@@ -18,6 +18,7 @@ import {
 import { writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { msg, render, translate, type Message, type MessageCode } from '../shared/i18n';
 import type { DetectionResult, Phase, Settings } from '../shared/types';
 import { buildActionCommand, runActionCommand } from './actions';
 import { Controller } from './controller';
@@ -80,14 +81,14 @@ function fakeDetector(mode: string): Detector {
           {
             pid: 4242,
             sessionId: '00000000-0000-0000-0000-000000000000',
-            name: busy ? 'ตัวอย่าง: session ที่กำลังทำงาน' : 'ตัวอย่าง: session ที่ทำงานเสร็จแล้ว',
+            name: busy ? 'Demo: working session' : 'Demo: finished session',
             cwd: 'C:\\Projects\\demo',
             entrypoint: 'claude-desktop',
             status: busy ? 'busy' : 'idle',
             waitingFor: null,
             verdict: busy ? 'working' : 'idle',
             blocksShutdown: busy,
-            reason: busy ? 'Claude กำลังทำงาน' : 'ว่าง',
+            reason: msg(busy ? 'reason.working' : 'reason.idle'),
             lastActivityAt: now - 4 * 60_000,
             transcriptState: busy ? 'running' : 'ended',
             toolProcesses: [],
@@ -107,14 +108,6 @@ const TRAY_COLORS: Record<string, Rgb> = {
   confirming: [245, 184, 61],
   countdown: [255, 107, 107],
   executing: [211, 58, 58],
-};
-
-const TRAY_TEXT: Record<string, string> = {
-  disarmed: 'ยังไม่ได้เริ่มเฝ้า',
-  monitoring: 'กำลังเฝ้า Claude',
-  confirming: 'Claude ว่างแล้ว กำลังยืนยัน',
-  countdown: 'กำลังนับถอยหลังก่อนปิดเครื่อง',
-  executing: 'กำลังปิดเครื่อง',
 };
 
 /** A crashed UI is reloaded, but not more often than this (avoids a crash loop). */
@@ -139,8 +132,8 @@ function main(): void {
   const icons = new Map<string, NativeImage>();
 
   // Unattended overnight: log unexpected errors and keep going, never block on an error dialog.
-  process.on('uncaughtException', (error) => reportError('ข้อผิดพลาดที่ไม่คาดคิด', error));
-  process.on('unhandledRejection', (reason) => reportError('ข้อผิดพลาดที่ไม่คาดคิด', reason));
+  process.on('uncaughtException', (error) => reportError('app.unexpectedError', error));
+  process.on('unhandledRejection', (reason) => reportError('app.unexpectedError', reason));
 
   const detector: Detector = FAKE_DETECTOR
     ? fakeDetector(FAKE_DETECTOR)
@@ -174,19 +167,23 @@ function main(): void {
   try {
     if (logs.store) controller.restoreLog(logs.store.recent(100));
   } catch (error) {
-    reportError('อ่าน log เก่าไม่สำเร็จ', error); // never stop start-up over old log entries
+    reportError('app.oldLogFailed', error); // never stop start-up over old log entries
   }
-  const keepAwake = new KeepAwake(userData, (message) => controller.addLog('warn', message));
+  const keepAwake = new KeepAwake(userData, (detail) => controller.addLog('warn', 'app.keepAwakeFailed', { detail }));
 
-  function reportError(where: string, error: unknown): void {
-    const message = error instanceof Error ? error.message : String(error);
+  /** `code` is a text with a {detail} placeholder for the error message. */
+  function reportError(code: MessageCode, error: unknown): void {
+    const detail = error instanceof Error ? error.message : String(error);
     try {
-      controller.addLog('error', `${where}: ${message}`);
+      controller.addLog('error', code, { detail });
     } catch {
       // the controller may not exist yet
     }
-    process.stderr.write(`${where}: ${error instanceof Error ? (error.stack ?? message) : message}\n`);
+    process.stderr.write(`${translate('en', code, { detail: error instanceof Error ? (error.stack ?? detail) : detail })}\n`);
   }
+
+  const language = () => controller.getSettings().language;
+  const t = (code: MessageCode): string => translate(language(), code);
 
   function iconFor(key: string): NativeImage {
     let image = icons.get(key);
@@ -215,9 +212,10 @@ function main(): void {
     }
   }
 
-  function notify(title: string, body: string): void {
+  function notify(title: Message, body: Message): void {
     try {
-      if (Notification.isSupported()) new Notification({ title, body, icon: appIconPath }).show();
+      const lang = language();
+      if (Notification.isSupported()) new Notification({ title: render(lang, title), body: render(lang, body), icon: appIconPath }).show();
     } catch {
       // notifications are best effort
     }
@@ -243,28 +241,29 @@ function main(): void {
   function updateTray(phase: Phase, confirming: boolean): void {
     if (!tray) return;
     const key = phase === 'monitoring' && confirming ? 'confirming' : phase;
-    if (key === trayKey) return;
-    trayKey = key;
+    const lang = language();
+    if (`${key}:${lang}` === trayKey) return;
+    trayKey = `${key}:${lang}`;
     tray.setImage(iconFor(key));
-    tray.setToolTip(`Claude Auto Shutdown · ${TRAY_TEXT[key] ?? ''}`);
+    tray.setToolTip(`Claude Auto Shutdown · ${translate(lang, `tray.tip.${key}`)}`);
     tray.setContextMenu(buildTrayMenu(phase));
   }
 
   function buildTrayMenu(phase: Phase): Menu {
     const toggle: MenuItemConstructorOptions =
       phase === 'disarmed'
-        ? { label: 'เริ่มเฝ้า', click: arm }
+        ? { label: t('tray.arm'), click: arm }
         : phase === 'monitoring'
-          ? { label: 'หยุดเฝ้า', click: () => controller.cancel() }
-          : { label: 'ยกเลิกการปิดเครื่อง', click: () => controller.cancel() };
+          ? { label: t('tray.stop'), click: () => controller.cancel() }
+          : { label: t('tray.cancel'), click: () => controller.cancel() };
     return Menu.buildFromTemplate([
-      { label: 'เปิดหน้าต่าง', click: showWindow },
+      { label: t('tray.open'), click: showWindow },
       { type: 'separator' },
       toggle,
-      { label: 'ตรวจสถานะเดี๋ยวนี้', click: () => schedulePoll(0, true) },
+      { label: t('tray.checkNow'), click: () => schedulePoll(0, true) },
       { type: 'separator' },
       {
-        label: 'ออกจากโปรแกรม',
+        label: t('tray.quit'),
         click: () => {
           quitting = true;
           app.quit();
@@ -292,7 +291,7 @@ function main(): void {
       pollThoroughly = false;
       controller
         .poll(options)
-        .catch((error: unknown) => reportError('ตรวจสถานะไม่สำเร็จ', error))
+        .catch((error: unknown) => reportError('app.checkFailed', error))
         .finally(() => schedulePoll());
     }, ms);
   }
@@ -321,7 +320,7 @@ function main(): void {
     win.webContents.on('will-navigate', (event) => event.preventDefault());
     win.webContents.on('render-process-gone', (_event, details) => {
       if (details.reason === 'clean-exit' || win.isDestroyed()) return;
-      controller.addLog('warn', `หน้าต่างหยุดทำงาน (${details.reason})`);
+      controller.addLog('warn', 'app.windowCrashed', { reason: details.reason });
       if (Date.now() - lastReloadAt > RELOAD_BACKOFF_MS) {
         lastReloadAt = Date.now();
         win.reload();
@@ -337,14 +336,14 @@ function main(): void {
       // Armed: the window goes away to free its memory; watching continues from the tray.
       if (!toldAboutTray) {
         toldAboutTray = true;
-        notify('ยังเฝ้าอยู่ใน tray', 'คลิกไอคอนรูปปุ่ม power ที่มุมจอเพื่อเปิดหน้าต่างอีกครั้ง');
+        notify(msg('notify.tray.title'), msg('notify.tray.body'));
       }
     });
     win.on('closed', () => {
       if (mainWindow === win) mainWindow = null;
       onTop = false;
     });
-    win.loadFile(path.join(__dirname, 'renderer', 'index.html')).catch((error: unknown) => reportError('เปิดหน้าต่างไม่สำเร็จ', error));
+    win.loadFile(path.join(__dirname, 'renderer', 'index.html')).catch((error: unknown) => reportError('app.windowLoadFailed', error));
     return win;
   }
 
@@ -393,7 +392,7 @@ function main(): void {
   const isRecord = (value: unknown): value is Record<string, unknown> => value !== null && typeof value === 'object';
   handle('state:get', () => controller.state());
   handle('arm', () => arm());
-  handle('disarm', () => controller.disarm('ผู้ใช้กดหยุดเฝ้า'));
+  handle('disarm', () => controller.disarm('stop.user'));
   handle('cancel', () => controller.cancel());
   handle('poll-now', () => schedulePoll(0, true));
   handle('settings:update', (patch) => {
@@ -453,19 +452,19 @@ function main(): void {
 
       setInterval(() => controller.tick(), 1000);
       setInterval(() => logs.store?.prune(), 60 * 60 * 1000); // keep only the last 30 days
-      powerMonitor.on('suspend', () => controller.addLog('info', 'เครื่องกำลังเข้าสู่ Sleep'));
+      powerMonitor.on('suspend', () => controller.addLog('info', 'app.suspending'));
       powerMonitor.on('resume', () => {
         controller.onResume();
         schedulePoll(0);
       });
 
-      controller.addLog('info', `เปิดโปรแกรม${DRY_RUN_FORCED ? ' (บังคับโหมดทดสอบด้วย --dry-run)' : ''}`);
-      if (logs.error) controller.addLog('warn', `เปิดฐานข้อมูล log ไม่ได้: ${logs.error}`);
+      controller.addLog('info', DRY_RUN_FORCED ? 'app.startedDryRun' : 'app.started');
+      if (logs.error) controller.addLog('warn', 'app.logDbFailed', { detail: logs.error });
       schedulePoll(0);
       if (AUTO_ARM) arm();
       if (CAPTURE_FILE) {
         setTimeout(() => {
-          capture(CAPTURE_FILE).catch((error: unknown) => reportError('capture', error));
+          capture(CAPTURE_FILE).catch((error: unknown) => reportError('app.captureFailed', error));
         }, CAPTURE_DELAY_MS);
       }
       if (EXIT_AFTER_MS !== null) {
@@ -478,5 +477,5 @@ function main(): void {
         }, EXIT_AFTER_MS);
       }
     })
-    .catch((error: unknown) => reportError('เริ่มโปรแกรมไม่สำเร็จ', error));
+    .catch((error: unknown) => reportError('app.startupFailed', error));
 }

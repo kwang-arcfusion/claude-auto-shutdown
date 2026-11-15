@@ -3,6 +3,7 @@ import { mkdtempSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { test } from 'node:test';
+import { DatabaseSync } from 'node:sqlite';
 import { LogStore } from '../src/main/log-store';
 
 const DAY = 24 * 60 * 60 * 1000;
@@ -51,4 +52,22 @@ test('entries older than 30 days are deleted by prune() and when the store opens
     ['fresh'],
   );
   reopened.close();
+});
+
+test('a log from an older version (no code columns) is upgraded and keeps its entries', () => {
+  const file = tempDb();
+  const now = 1_800_000_000_000;
+  const old = new DatabaseSync(file);
+  old.exec('CREATE TABLE events (id INTEGER PRIMARY KEY AUTOINCREMENT, at INTEGER NOT NULL, level TEXT NOT NULL, message TEXT NOT NULL)');
+  old.prepare('INSERT INTO events (at, level, message) VALUES (?, ?, ?)').run(now - 2_000, 'info', 'old text');
+  old.close();
+
+  const store = new LogStore(file, 30, () => now);
+  store.append({ at: now - 1_000, level: 'warn', code: 'log.actionSent', params: { command: 'shutdown /s /t 0' } });
+  const [legacy, coded] = store.recent(10);
+  assert.deepEqual(legacy, { at: now - 2_000, level: 'info', message: 'old text' });
+  assert.equal(coded!.code, 'log.actionSent');
+  assert.deepEqual(coded!.params, { command: 'shutdown /s /t 0' });
+  assert.equal(coded!.message, 'Sent shutdown /s /t 0'); // English copy for reading the file directly
+  store.close();
 });
