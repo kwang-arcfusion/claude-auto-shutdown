@@ -76,6 +76,8 @@ export interface DetectionResult {
   error: string | null;
   claudeDir: string;
   usedProcessSnapshot: boolean;
+  /** Processes were not inspected (display-only check): an 'idle' aggregate is unverified. */
+  partial?: boolean;
   durationMs: number;
 }
 
@@ -94,6 +96,8 @@ export interface AppState {
   armedAt: number | null;
   idleSince: number | null;
   countdownEndsAt: number | null;
+  /** Length of the running countdown (a real shutdown gets at least a minute). */
+  countdownTotalMs: number | null;
   lastDetection: DetectionResult | null;
   nextPollAt: number | null;
   settings: Settings;

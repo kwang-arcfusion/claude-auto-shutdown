@@ -22,22 +22,51 @@ export interface ProcessSnapshot {
 }
 
 export interface SnapshotSource {
-  take(): Promise<ProcessSnapshot>;
+  /** Snapshot of the `roots` processes and all of their descendants. */
+  take(roots: readonly number[]): Promise<ProcessSnapshot>;
 }
 
 /**
- * Lists every process with its parent, creation time, CPU time, I/O and command line.
- * Windows PowerShell 5.1 is always present; wmic is not (it is gone on this machine).
+ * Reports the given root processes and their descendants: parent, creation time, CPU time,
+ * I/O and command line. Everything else is filtered out inside this short-lived PowerShell,
+ * so other programs' command lines (which can contain secrets) never reach the app.
+ * One CIM query is used: a second, filtered query for command lines costs ~0.5 s more.
+ * Windows PowerShell 5.1 is always present; wmic is not.
  */
 const SNAPSHOT_SCRIPT = String.raw`
+param([string]$Roots = '')
 $ErrorActionPreference = 'Stop'
 try { [Console]::OutputEncoding = New-Object System.Text.UTF8Encoding $false } catch { }
 $props = 'ProcessId','ParentProcessId','Name','CreationDate','KernelModeTime','UserModeTime','ReadTransferCount','WriteTransferCount','OtherTransferCount','CommandLine'
-$rows = foreach ($p in Get-CimInstance -ClassName Win32_Process -Property $props) {
+$all = @(Get-CimInstance -ClassName Win32_Process -Property $props)
+$children = @{}
+foreach ($p in $all) {
+  $parent = [int]$p.ParentProcessId
+  if (-not $children.ContainsKey($parent)) { $children[$parent] = New-Object System.Collections.Generic.List[object] }
+  $children[$parent].Add($p)
+}
+$keep = New-Object 'System.Collections.Generic.HashSet[int]'
+$queue = New-Object 'System.Collections.Generic.Queue[int]'
+foreach ($text in ($Roots -split ',')) {
+  $id = 0
+  if ([int]::TryParse($text, [ref]$id) -and $id -gt 0 -and $keep.Add($id)) { $queue.Enqueue($id) }
+}
+while ($queue.Count -gt 0) {
+  $id = $queue.Dequeue()
+  if ($children.ContainsKey($id)) {
+    foreach ($c in $children[$id]) {
+      $cid = [int]$c.ProcessId
+      if ($keep.Add($cid)) { $queue.Enqueue($cid) }
+    }
+  }
+}
+$rows = foreach ($p in $all) {
+  $id = [int]$p.ProcessId
+  if (-not $keep.Contains($id)) { continue }
   $created = '0'
   if ($p.CreationDate) { $created = $p.CreationDate.ToFileTimeUtc().ToString() }
   [pscustomobject]@{
-    p = [int]$p.ProcessId
+    p = $id
     pp = [int]$p.ParentProcessId
     n = [string]$p.Name
     c = $created
@@ -92,13 +121,14 @@ export class PowerShellSnapshotter implements SnapshotSource {
     return this.scriptPath;
   }
 
-  async take(): Promise<ProcessSnapshot> {
+  async take(roots: readonly number[]): Promise<ProcessSnapshot> {
     const script = await this.ensureScript();
     const powershell = path.join(process.env.SystemRoot ?? 'C:\\Windows', 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe');
+    const rootList = roots.filter((pid) => Number.isInteger(pid) && pid > 0).join(',');
     const stdout = await new Promise<string>((resolve, reject) => {
       execFile(
         powershell,
-        ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', script],
+        ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', script, '-Roots', rootList],
         { windowsHide: true, timeout: this.timeoutMs, maxBuffer: 64 * 1024 * 1024, encoding: 'utf8' },
         (error, out, errOut) => {
           if (error) {

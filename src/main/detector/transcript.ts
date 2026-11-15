@@ -146,16 +146,31 @@ export async function readTranscriptState(file: string, size: number): Promise<T
   return (await readTranscriptInfo(file, size)).state;
 }
 
-/** Caches transcript analysis by file size and modification time. */
+/**
+ * Caches transcript analysis by file size and modification time. Least recently used entries
+ * are evicted one at a time, so a session with hundreds of subagents never forces a re-read
+ * of everything.
+ */
 export class TranscriptInfoCache {
   private readonly entries = new Map<string, { mtimeMs: number; size: number; info: TranscriptInfo }>();
 
+  constructor(private readonly limit = 2000) {}
+
+  get size(): number {
+    return this.entries.size;
+  }
+
   async get(file: string, mtimeMs: number, size: number): Promise<TranscriptInfo> {
     const hit = this.entries.get(file);
-    if (hit && hit.mtimeMs === mtimeMs && hit.size === size) return hit.info;
+    if (hit && hit.mtimeMs === mtimeMs && hit.size === size) {
+      this.entries.delete(file); // Map order = recency
+      this.entries.set(file, hit);
+      return hit.info;
+    }
     const info = await readTranscriptInfo(file, size);
-    if (this.entries.size > 1000) this.entries.clear();
+    this.entries.delete(file);
     this.entries.set(file, { mtimeMs, size, info });
+    while (this.entries.size > this.limit) this.entries.delete(this.entries.keys().next().value!);
     return info;
   }
 }
@@ -204,8 +219,9 @@ export class TranscriptLocator {
         }
       }
     }
-    if (this.cache.size > 500) this.cache.clear();
+    this.cache.delete(sessionId);
     this.cache.set(sessionId, { file: found, checkedAt: now });
+    if (this.cache.size > 500) this.cache.delete(this.cache.keys().next().value!);
     return found;
   }
 }

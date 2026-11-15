@@ -53,6 +53,7 @@ test('the shutdown command forces apps closed only when asked', () => {
   const sleep = buildActionCommand('sleep', true, 'C:\\Windows');
   assert.match(sleep.file, /powershell\.exe$/i);
   assert.match(sleep.args.join(' '), /SetSuspendState/);
+  assert.match(sleep.args.join(' '), /exit 1/); // a failed sleep must not look like success
 });
 
 test('formatMinutes', () => {

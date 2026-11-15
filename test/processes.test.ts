@@ -8,8 +8,12 @@ import {
   isToolProcess,
   msToFiletime,
   processMatchesSession,
+  sessionIdentity,
   sleepEndsAt,
 } from '../src/main/detector/tree';
+
+const MIN = 60_000;
+const HOUR = 60 * MIN;
 
 const P = (pid: number, ppid: number, name: string, cmd = '', created = 1000 + pid, cpuTicks = 0, ioBytes = 0): ProcInfo => ({
   pid,
@@ -74,6 +78,23 @@ test('processMatchesSession falls back to startedAt: the process must not start 
   assert.equal(processMatchesSession({ startedAt }, P(1, 0, 'claude.exe', '', msToFiletime(startedAt + 60_000))), false);
 });
 
+test('sessionIdentity drops a session only with evidence that its file is stale', () => {
+  const now = 1_800_000_000_000;
+  const file = { procStart: String(msToFiletime(now - HOUR)), updatedAt: now - 10 * MIN };
+  assert.equal(sessionIdentity(file, P(1, 0, 'claude.exe', '', msToFiletime(now - HOUR))), 'match');
+  assert.equal(sessionIdentity(file, undefined), 'stale');
+  // The PID now belongs to a process started after the file was last written: reused.
+  assert.equal(sessionIdentity(file, P(1, 0, 'other.exe', '', msToFiletime(now - MIN))), 'stale');
+  // A mismatch with no explanation (e.g. a new procStart format) is unsure, never silently stale.
+  assert.equal(sessionIdentity({ ...file, procStart: '12345' }, P(1, 0, 'claude.exe', '', msToFiletime(now - HOUR))), 'unsure');
+});
+
+test('classifyDescendants reports the newest creation time, console hosts included', () => {
+  const root = P(100, 1, 'claude.exe', '', msToFiletime(1_000_000));
+  const procs = [root, P(101, 100, 'mcp.exe', '', msToFiletime(2_000_000)), P(102, 100, 'conhost.exe', '', msToFiletime(5_000_000))];
+  assert.equal(Math.round(classifyDescendants(indexProcesses(procs), root).newestCreatedAt!), 5_000_000);
+});
+
 test('FILETIME conversions', () => {
   assert.equal(Math.round(filetimeToMs(Number('134391962772404597'))), 1_794_722_677_240);
   assert.equal(filetimeToMs(msToFiletime(1_800_000_000_000)), 1_800_000_000_000);
@@ -88,6 +109,8 @@ test('sleepEndsAt understands timed waits, and nothing else', () => {
   assert.equal(at('timeout.exe', 'timeout /t 90 /nobreak'), start + 90_000);
   assert.equal(at('sleep.exe', 'sleep infinity'), null);
   assert.equal(at('node.exe', 'node sleep 3600'), null);
+  // A huge wait is trusted for 6 hours at most.
+  assert.equal(at('sleep.exe', 'sleep 999999'), start + 6 * 3_600_000);
 });
 
 test('parseSnapshotJson accepts an array or a single object, reads I/O and skips pid 0', () => {

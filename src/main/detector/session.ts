@@ -76,6 +76,12 @@ export interface ProcessFacts {
   helperCpuPercent: number | null;
   /** When the tool processes last showed any activity (CPU, I/O, output, process changes, timed sleep). */
   toolsActiveAt: number | null;
+  /** Newest creation time (ms) among all of the session's descendants. */
+  newestChildAt?: number | null;
+  /** Helper processes used CPU or I/O since the previous check (true when unknown). */
+  helpersActiveNow?: boolean;
+  /** Status "shell" with no recognised tool: when any descendant last showed activity. */
+  shellActiveAt?: number | null;
 }
 
 export interface EvaluateInput extends SessionActivity {
@@ -101,6 +107,10 @@ export const SIDE_ACTIVITY_WINDOW_MS = 2 * MIN;
 export const PERMISSION_GRACE_MS = MIN;
 /** A scheduled wake-up keeps the session busy until this long after it is due. */
 export const WAKE_GRACE_MS = 5 * MIN;
+/** Process creation times and transcript timestamps come from different clocks. */
+const CHILD_TIME_SLACK_MS = 2_000;
+/** Helper CPU can stretch the silence rule of a busy turn, but only this far. */
+export const HELPER_EXTENSION_MAX_MS = 3 * 60 * MIN;
 
 /** Tools that always wait for the user. */
 const QUESTION_TOOLS: Record<string, string> = { AskUserQuestion: 'ตอบคำถาม', ExitPlanMode: 'อนุมัติแผน' };
@@ -142,7 +152,7 @@ type Waiting = { since: number; what: string } | 'check' | null;
 
 /** Is the session waiting for the user? 'check' = only a process snapshot can tell. */
 function detectWaiting(input: EvaluateInput, busy: boolean, latest: number | null, toolsRunning: boolean | null): Waiting {
-  const { file, now } = input;
+  const { file, now, processes } = input;
   if (file.waitingFor !== undefined) return { since: latest ?? now, what: WAITING_FOR_TEXT[file.waitingFor] ?? file.waitingFor };
   if (!busy) return null;
   let needsCheck = false;
@@ -153,8 +163,15 @@ function detectWaiting(input: EvaluateInput, busy: boolean, latest: number | nul
     if (now - at < PERMISSION_GRACE_MS) continue;
     if (INSTANT_TOOLS.has(tool.name)) return { since: at, what: `อนุญาตให้ใช้ ${tool.name}` };
     if (SHELL_TOOLS.has(tool.name)) {
-      if (toolsRunning === null) needsCheck = true;
-      else if (!toolsRunning) return { since: at, what: `อนุญาตให้ใช้ ${tool.name}` };
+      if (processes === null || toolsRunning === null) {
+        needsCheck = true;
+        continue;
+      }
+      // An allowed command starts processes. Anything started since the call (even a shell
+      // without a known marker) or any helper activity means it is running, not waiting.
+      const newest = processes.newestChildAt ?? null;
+      const startedSince = newest !== null && newest >= at - CHILD_TIME_SLACK_MS;
+      if (!toolsRunning && !startedSince && processes.helpersActiveNow !== true) return { since: at, what: `อนุญาตให้ใช้ ${tool.name}` };
     }
   }
   return needsCheck ? 'check' : null;
@@ -167,13 +184,32 @@ export function evaluateSession(input: EvaluateInput): Evaluation {
   // Without a status field, fall back to the transcript; an unreadable transcript counts as busy.
   const busy = file.status !== undefined ? file.status === 'busy' : input.transcriptState !== 'ended';
 
+  const toolStallMs = settings.toolStallMinutes * MIN;
+  const stalledMs = settings.stalledMinutes * MIN;
+
   // 1. Commands Claude started, including background tasks: wait while they show any activity.
   let hung: ProcInfo[] = [];
   if (processes && processes.tools.length > 0) {
     const idleMs = now - (processes.toolsActiveAt ?? now);
-    const stallMs = settings.toolStallMinutes * MIN;
-    if (stallMs <= 0 || idleMs < stallMs) return result('tool', true, `กำลังรันคำสั่ง (${toolNames(processes.tools)})`);
+    if (toolStallMs <= 0 || idleMs < toolStallMs) return result('tool', true, `กำลังรันคำสั่ง (${toolNames(processes.tools)})`);
     hung = processes.tools; // no CPU, I/O, output or process changes for too long
+  }
+
+  // 1b. Claude Code itself says a shell is still running ("shell"), but none carries a known
+  // marker (another shell, unreadable command lines...): judge by the activity of everything
+  // under the session; with nothing to measure, fall back to the long-silence rule.
+  let shellHungMs: number | null = null;
+  if (file.status === 'shell' && (processes === null || processes.tools.length === 0)) {
+    const reason = 'Claude บอกว่ายังมี shell รันอยู่';
+    if (processes === null) return result('tool', true, reason, true);
+    const activeAt = processes.shellActiveAt ?? null;
+    if (activeAt !== null) {
+      if (toolStallMs <= 0 || now - activeAt < toolStallMs) return result('tool', true, reason);
+      shellHungMs = now - activeAt;
+    } else {
+      if (stalledMs <= 0 || quietMs < stalledMs) return result('tool', true, reason);
+      shellHungMs = quietMs;
+    }
   }
   const toolsRunning = processes === null ? null : processes.tools.length > 0 && hung.length === 0;
 
@@ -189,15 +225,17 @@ export function evaluateSession(input: EvaluateInput): Evaluation {
 
   const helperBusy =
     processes !== null && processes.helperCpuPercent !== null && processes.helperCpuPercent >= settings.backgroundCpuPercent;
-  const stalledMs = settings.stalledMinutes * MIN;
 
-  // 3. A turn in progress: finished only after a long silence.
+  // 3. A turn in progress: finished only after a long silence. Helper CPU (an MCP call, say)
+  // can stretch that, but not forever: a spinning helper must not keep the PC on all night.
   if (busy || waiting) {
     if (stalledMs > 0 && quietMs >= stalledMs) {
       if (processes === null) {
         return result(waiting ? 'waiting' : 'working', true, `เงียบมา ${quietText(quietMs)} กำลังตรวจ process เพื่อยืนยัน`, true);
       }
-      if (!helperBusy) return result('stalled', false, `ไม่มีความเคลื่อนไหว ${quietText(quietMs)} จึงนับว่าเสร็จ`);
+      if (!helperBusy || quietMs >= HELPER_EXTENSION_MAX_MS) {
+        return result('stalled', false, `ไม่มีความเคลื่อนไหว ${quietText(quietMs)} จึงนับว่าเสร็จ`);
+      }
     }
     if (waiting) return result('waiting', true, `รอผู้ใช้${waiting.what}`);
     return result(
@@ -217,10 +255,15 @@ export function evaluateSession(input: EvaluateInput): Evaluation {
   if (input.sideActivityAt !== null && now - input.sideActivityAt < SIDE_ACTIVITY_WINDOW_MS) {
     return result('background', true, 'มี subagent หรือไฟล์ของ session ถูกเขียนเมื่อไม่นานนี้');
   }
-  if (helperBusy) return result('background', true, `process เบื้องหลังใช้ CPU ${processes!.helperCpuPercent!.toFixed(1)}%`);
+  // Helper CPU after the turn (headless browser, busy MCP server...) counts only for a while.
+  const turnOverForMs = now - (file.statusUpdatedAt ?? latest ?? now);
+  if (helperBusy && (toolStallMs <= 0 || turnOverForMs < toolStallMs)) {
+    return result('background', true, `process เบื้องหลังใช้ CPU ${processes!.helperCpuPercent!.toFixed(1)}%`);
+  }
   if (hung.length > 0) {
     const idleMs = now - (processes!.toolsActiveAt ?? now);
     return result('stalled', false, `คำสั่งเบื้องหลังไม่ขยับมา ${quietText(idleMs)} จึงนับว่าค้าง (${toolNames(hung)})`);
   }
+  if (shellHungMs !== null) return result('stalled', false, `shell ที่ Claude เปิดไว้ไม่ขยับมา ${quietText(shellHungMs)} จึงนับว่าค้าง`);
   return result('idle', false, processes ? 'ว่าง' : 'ว่าง (ยังไม่ได้ตรวจ process เบื้องหลัง)');
 }

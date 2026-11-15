@@ -31,19 +31,24 @@ const clock = (ms: number): string => new Date(ms).toTimeString().slice(0, 8);
 const bashTool = (cmd: string): string =>
   `"C:\\Program Files\\Git\\bin\\bash.exe" -c "source /c/Users/me/.claude/shell-snapshots/snapshot-bash-1.sh && eval '${cmd}'"`;
 
+type Status = 'busy' | 'idle' | 'shell';
+
 interface FakeSession {
   sessionId: string;
   cwd: string;
-  status: 'busy' | 'idle';
+  status: Status;
   statusUpdatedAt: number;
   transcript: string;
 }
 
-/** A process Claude started; cpuShare is the fraction of a core it keeps busy. */
+/** A process Claude started: it keeps cpuShare of a core busy and moves ioPerSec bytes a second. */
 interface FakeTool {
   proc: Omit<ProcInfo, 'cpuTicks' | 'ioBytes'>;
-  startedAt: number;
   cpuShare: number;
+  ioPerSec: number;
+  cpuTicks: number;
+  ioBytes: number;
+  lastAt: number;
 }
 
 class Night {
@@ -167,14 +172,21 @@ class Night {
   }
 
   /** A run_in_background command that keeps going after the turn ends. */
-  backgroundStart(pid: number, cmd: string, options: { cpuShare?: number; sleepSeconds?: number } = {}): void {
+  backgroundStart(
+    pid: number,
+    cmd: string,
+    options: { cpuShare?: number; ioPerSec?: number; sleepSeconds?: number; marker?: boolean } = {},
+  ): void {
     const id = this.callTool(pid, 'Bash');
-    const shell = this.addTool(pid, cmd, options.cpuShare ?? 0);
+    const shell = this.addTool(pid, cmd, options.cpuShare ?? 0, { ioPerSec: options.ioPerSec, marker: options.marker });
     if (options.sleepSeconds !== undefined) {
       this.tools.get(pid)!.push({
         proc: { pid: this.nextPid++, ppid: shell.pid, name: 'sleep.exe', created: msToFiletime(this.now), cmd: `sleep ${options.sleepSeconds}` },
-        startedAt: this.now,
         cpuShare: 0,
+        ioPerSec: 0,
+        cpuTicks: 0,
+        ioBytes: 0,
+        lastAt: this.now,
       });
     }
     this.toolResult(pid, id, 'Command running in background');
@@ -182,6 +194,20 @@ class Night {
 
   backgroundEnd(pid: number): void {
     this.tools.delete(pid);
+  }
+
+  /** Changes how busy a session's commands are from now on. */
+  setToolActivity(pid: number, activity: { cpuShare?: number; ioPerSec?: number }): void {
+    for (const tool of this.tools.get(pid) ?? []) {
+      this.advance(tool);
+      if (activity.cpuShare !== undefined) tool.cpuShare = activity.cpuShare;
+      if (activity.ioPerSec !== undefined) tool.ioPerSec = activity.ioPerSec;
+    }
+  }
+
+  /** Claude Code reports "shell": the turn is over but a shell is still running. */
+  shellStatus(pid: number): void {
+    this.setStatus(pid, 'shell');
   }
 
   /** Starts a background agent: the main turn can end while the subagent keeps working. */
@@ -294,7 +320,7 @@ class Night {
     );
   }
 
-  private setStatus(pid: number, status: 'busy' | 'idle'): void {
+  private setStatus(pid: number, status: Status): void {
     const s = this.sessions.get(pid)!;
     s.status = status;
     s.statusUpdatedAt = this.now;
@@ -320,10 +346,25 @@ class Night {
     utimesSync(file, time, time);
   }
 
-  private addTool(pid: number, cmd: string, cpuShare: number): Omit<ProcInfo, 'cpuTicks' | 'ioBytes'> {
-    const proc = { pid: this.nextPid++, ppid: pid, name: 'bash.exe', created: msToFiletime(this.now), cmd: bashTool(cmd) };
-    this.tools.set(pid, [...(this.tools.get(pid) ?? []), { proc, startedAt: this.now, cpuShare }]);
+  /** marker: false = a shell without Claude Code's command-line marker. */
+  private addTool(
+    pid: number,
+    cmd: string,
+    cpuShare: number,
+    options: { ioPerSec?: number; marker?: boolean } = {},
+  ): Omit<ProcInfo, 'cpuTicks' | 'ioBytes'> {
+    const commandLine = options.marker === false ? `bash.exe -c "${cmd}"` : bashTool(cmd);
+    const proc = { pid: this.nextPid++, ppid: pid, name: 'bash.exe', created: msToFiletime(this.now), cmd: commandLine };
+    const tool: FakeTool = { proc, cpuShare, ioPerSec: options.ioPerSec ?? 0, cpuTicks: 0, ioBytes: 0, lastAt: this.now };
+    this.tools.set(pid, [...(this.tools.get(pid) ?? []), tool]);
     return proc;
+  }
+
+  private advance(tool: FakeTool): void {
+    const elapsed = this.now - tool.lastAt;
+    tool.cpuTicks += elapsed * 10_000 * tool.cpuShare;
+    tool.ioBytes += (elapsed / 1000) * tool.ioPerSec;
+    tool.lastAt = this.now;
   }
 
   private snapshot(): ProcessSnapshot {
@@ -333,7 +374,8 @@ class Night {
       procs.push({ pid, ppid: 1, name: 'claude.exe', created: pid * 1_000, cpuTicks: 0, ioBytes: 0, cmd: 'claude.exe --output-format stream-json' });
       procs.push({ pid: pid + 1, ppid: pid, name: 'mcp-server.exe', created: pid * 1_000 + 1, cpuTicks: 0, ioBytes: 0, cmd: 'mcp-server.exe --stdio' });
       for (const tool of this.tools.get(pid) ?? []) {
-        procs.push({ ...tool.proc, cpuTicks: Math.round((this.now - tool.startedAt) * 10_000 * tool.cpuShare), ioBytes: 0 });
+        this.advance(tool);
+        procs.push({ ...tool.proc, cpuTicks: Math.round(tool.cpuTicks), ioBytes: Math.round(tool.ioBytes) });
       }
     }
     return { at: this.now, procs };
@@ -533,6 +575,22 @@ test('a background agent keeps working (with a 40-minute silence) after the main
   await night.run();
   night.expectNoCountdownBefore('02:00');
   night.expectShutdownBetween('02:31', '02:33');
+});
+
+test('a background download in a shell without our marker (status "shell") keeps it on, then counts as hung', async () => {
+  const night = new Night();
+  night
+    .at('23:00', () => start(night))
+    .working(100, '23:00', '23:30')
+    .at('23:30', () => night.backgroundStart(100, 'curl -O big.iso', { marker: false, ioPerSec: 50_000 }))
+    .at('23:31', () => {
+      night.reply(100);
+      night.shellStatus(100);
+    })
+    .at('01:00', () => night.setToolActivity(100, { ioPerSec: 0 })); // done, but the shell stays open
+  await night.run();
+  night.expectNoCountdownBefore('01:20');
+  night.expectShutdownBetween('01:50', '01:52');
 });
 
 // ---- loops ---------------------------------------------------------------------------------

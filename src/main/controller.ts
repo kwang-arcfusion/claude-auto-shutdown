@@ -9,7 +9,8 @@ export interface ActionResult {
 
 export interface ControllerDeps {
   now(): number;
-  detect(settings: Settings): Promise<DetectionResult>;
+  /** thorough = inspect processes when needed; false = files only (display while disarmed). */
+  detect(settings: Settings, thorough: boolean): Promise<DetectionResult>;
   runAction(settings: Settings, dryRun: boolean): Promise<ActionResult>;
   describeAction(settings: Settings): string;
   /** Seconds since the last mouse or keyboard input (Electron powerMonitor). */
@@ -21,6 +22,8 @@ export interface ControllerDeps {
   onChange(): void;
   onCountdownStarted?(): void;
   defaultClaudeDir: string;
+  /** A gap between ticks longer than this during the countdown means sleep or a clock jump. */
+  maxTickGapMs?: number;
 }
 
 const MAX_LOG = 200;
@@ -29,6 +32,9 @@ const FINAL_CHECK_MAX_FAILURES = 3;
 /** Input within this many seconds of the countdown starting is ignored. */
 const USER_ACTIVITY_GRACE_SEC = 2;
 const EXECUTING_WATCHDOG_MS = 5 * 60_000;
+/** A real shutdown always gets at least this much countdown, whatever the settings say. */
+const MIN_REAL_COUNTDOWN_MS = 60_000;
+const DEFAULT_MAX_TICK_GAP_MS = 5_000;
 
 /**
  * The arm → monitor → countdown → act state machine. It owns no timers: the host
@@ -40,11 +46,13 @@ export class Controller {
   private idleSince: number | null = null;
   private countdownStartedAt: number | null = null;
   private countdownEndsAt: number | null = null;
+  private countdownTotalMs: number | null = null;
+  private lastTickAt: number | null = null;
   private executingSince: number | null = null;
   private lastDetection: DetectionResult | null = null;
   private nextPollAt: number | null = null;
   private log: LogEntry[] = [];
-  private inFlight: Promise<DetectionResult> | null = null;
+  private inFlight: { promise: Promise<DetectionResult>; thorough: boolean } | null = null;
   private finalCheckRunning: Promise<void> | null = null;
   private finalCheckFailures = 0;
 
@@ -76,6 +84,7 @@ export class Controller {
       armedAt: this.armedAt,
       idleSince: this.idleSince,
       countdownEndsAt: this.countdownEndsAt,
+      countdownTotalMs: this.countdownTotalMs,
       lastDetection: this.lastDetection,
       nextPollAt: this.nextPollAt,
       settings: this.settings,
@@ -109,6 +118,7 @@ export class Controller {
     this.idleSince = null;
     this.countdownStartedAt = null;
     this.countdownEndsAt = null;
+    this.countdownTotalMs = null;
     this.executingSince = null;
     this.deps.setPreventSleep(false);
     this.addLog(level, `หยุดเฝ้า: ${reason}`);
@@ -120,8 +130,9 @@ export class Controller {
     this.disarm(this.phase === 'countdown' || this.phase === 'executing' ? 'ผู้ใช้กดยกเลิกการปิดเครื่อง' : 'ผู้ใช้กดหยุดเฝ้า');
   }
 
-  async poll(): Promise<DetectionResult> {
-    const result = await this.detect();
+  /** Checks once. Thorough by default while armed; `thorough: true` forces it (user asked). */
+  async poll(options: { thorough?: boolean } = {}): Promise<DetectionResult> {
+    const result = await this.detect(options.thorough ?? this.phase !== 'disarmed');
     this.handleDetection(result);
     this.deps.onChange();
     return result;
@@ -130,6 +141,8 @@ export class Controller {
   /** Called every second: countdown deadline, user activity and the executing watchdog. */
   tick(): void {
     const now = this.deps.now();
+    const previousTick = this.lastTickAt;
+    this.lastTickAt = now;
     if (this.phase === 'executing') {
       if (this.executingSince !== null && now - this.executingSince > EXECUTING_WATCHDOG_MS) {
         this.disarm('สั่งไปแล้วแต่เครื่องยังทำงานอยู่หลัง 5 นาที', 'warn');
@@ -137,6 +150,14 @@ export class Controller {
       return;
     }
     if (this.phase !== 'countdown' || this.countdownStartedAt === null || this.countdownEndsAt === null) return;
+
+    // After sleep the timers can fire before the resume event (or never get it), and the clock
+    // can jump: never let the countdown finish on time that nobody was watching.
+    if (previousTick !== null && now - previousTick > (this.deps.maxTickGapMs ?? DEFAULT_MAX_TICK_GAP_MS)) {
+      this.backToMonitoring('เครื่องเพิ่งตื่นหรือเวลาเครื่องเปลี่ยนระหว่างนับถอยหลัง จึงเริ่มยืนยันใหม่');
+      this.deps.onChange();
+      return;
+    }
 
     if (this.settings.cancelOnUserActivity) {
       const elapsedSec = (now - this.countdownStartedAt) / 1000;
@@ -174,19 +195,24 @@ export class Controller {
   }
 
   updateSettings(patch: Partial<Settings>): Settings {
-    this.settings = sanitizeSettings({ ...this.settings, ...patch }, this.settings);
-    this.deps.saveSettings(this.settings);
-    if (this.phase === 'monitoring' || this.phase === 'countdown') this.deps.setPreventSleep(this.settings.preventSleepWhileArmed);
-    this.deps.onChange();
-    return this.settings;
+    return this.applySettings(sanitizeSettings({ ...this.settings, ...patch }, this.settings));
   }
 
   resetSettings(): Settings {
-    this.settings = { ...DEFAULT_SETTINGS };
-    this.deps.saveSettings(this.settings);
-    if (this.phase === 'monitoring' || this.phase === 'countdown') this.deps.setPreventSleep(this.settings.preventSleepWhileArmed);
+    return this.applySettings({ ...DEFAULT_SETTINGS });
+  }
+
+  /** Applies settings in memory and saves them; a failed save is logged, never half-applied. */
+  private applySettings(next: Settings): Settings {
+    this.settings = next;
+    try {
+      this.deps.saveSettings(next);
+    } catch (error) {
+      this.addLog('warn', `บันทึกการตั้งค่าลงไฟล์ไม่สำเร็จ (ใช้ได้จนกว่าจะปิดโปรแกรม): ${error instanceof Error ? error.message : String(error)}`);
+    }
+    if (this.phase === 'monitoring' || this.phase === 'countdown') this.deps.setPreventSleep(next.preventSleepWhileArmed);
     this.deps.onChange();
-    return this.settings;
+    return next;
   }
 
   /** Shows entries saved by a previous run (they are already persisted). */
@@ -201,28 +227,35 @@ export class Controller {
     this.deps.persistLog(entry);
   }
 
-  /** One detection at a time; the poll loop and the final check share it. */
-  private detect(): Promise<DetectionResult> {
-    if (!this.inFlight) {
-      const settings = this.settings;
-      this.inFlight = this.deps
-        .detect(settings)
-        .catch(
-          (error: unknown): DetectionResult => ({
-            at: this.deps.now(),
-            aggregate: 'unknown',
-            sessions: [],
-            error: error instanceof Error ? error.message : String(error),
-            claudeDir: '',
-            usedProcessSnapshot: false,
-            durationMs: 0,
-          }),
-        )
-        .finally(() => {
-          this.inFlight = null;
-        });
-    }
-    return this.inFlight;
+  /**
+   * One detection at a time; the poll loop and the final check share it. A thorough request
+   * never reuses a files-only check, and a fresh one never reuses anything: they wait for the
+   * running check to finish and then run their own.
+   */
+  private detect(thorough: boolean, fresh = false): Promise<DetectionResult> {
+    const current = this.inFlight;
+    if (!fresh && current && (current.thorough || !thorough)) return current.promise;
+    const run = async (): Promise<DetectionResult> => {
+      if (current) await current.promise; // never rejects
+      try {
+        return await this.deps.detect(this.settings, thorough);
+      } catch (error) {
+        return {
+          at: this.deps.now(),
+          aggregate: 'unknown',
+          sessions: [],
+          error: error instanceof Error ? error.message : String(error),
+          claudeDir: '',
+          usedProcessSnapshot: false,
+          durationMs: 0,
+        };
+      }
+    };
+    const promise = run().finally(() => {
+      if (this.inFlight?.promise === promise) this.inFlight = null;
+    });
+    this.inFlight = { promise, thorough };
+    return promise;
   }
 
   private recordDetection(result: DetectionResult): void {
@@ -233,6 +266,9 @@ export class Controller {
 
   private handleDetection(result: DetectionResult): void {
     this.recordDetection(result);
+    // A files-only result cannot prove Claude is idle (background commands were not checked),
+    // e.g. one started while disarmed and finished just after arming. It only counts when busy.
+    if (result.partial && result.aggregate !== 'busy' && this.phase !== 'disarmed') return;
     const now = this.deps.now();
     if (this.phase === 'monitoring') {
       if (result.aggregate === 'idle') {
@@ -255,12 +291,16 @@ export class Controller {
   }
 
   private startCountdown(now: number): void {
+    const s = this.settings;
+    // Always leave a real shutdown a minute in which it can still be cancelled.
+    const totalMs = this.effectiveDryRun ? s.countdownMinutes * 60_000 : Math.max(s.countdownMinutes * 60_000, MIN_REAL_COUNTDOWN_MS);
     this.phase = 'countdown';
     this.countdownStartedAt = now;
-    this.countdownEndsAt = now + this.settings.countdownMinutes * 60_000;
+    this.countdownEndsAt = now + totalMs;
+    this.countdownTotalMs = totalMs;
+    this.lastTickAt = now;
     this.finalCheckFailures = 0;
-    const s = this.settings;
-    const message = `Claude ว่างครบ ${formatMinutes(s.idleConfirmMinutes)} แล้ว จะ${ACTION_LABEL[s.action]}ในอีก ${formatMinutes(s.countdownMinutes)}`;
+    const message = `Claude ว่างครบ ${formatMinutes(s.idleConfirmMinutes)} แล้ว จะ${ACTION_LABEL[s.action]}ในอีก ${formatMinutes(totalMs / 60_000)}`;
     this.addLog('warn', message);
     this.deps.notify('เริ่มนับถอยหลังก่อนปิดเครื่อง', message);
     this.deps.onCountdownStarted?.();
@@ -271,16 +311,27 @@ export class Controller {
     this.idleSince = null;
     this.countdownStartedAt = null;
     this.countdownEndsAt = null;
+    this.countdownTotalMs = null;
     this.addLog('info', reason);
     this.deps.notify('ยกเลิกการนับถอยหลัง', reason);
   }
 
   private async finalCheck(): Promise<void> {
     try {
-      const result = await this.detect();
+      // A fresh, thorough check: never a result that was started earlier.
+      const result = await this.detect(true, true);
       this.recordDetection(result);
       if (this.phase !== 'countdown') return; // cancelled while checking
       if (result.aggregate === 'idle') {
+        // One last cheap look at the session files right before acting: a turn may have
+        // started during the seconds the process snapshot took.
+        const latest = await this.detect(false, true);
+        if (this.phase !== 'countdown') return;
+        if (latest.aggregate === 'busy') {
+          this.recordDetection(latest);
+          this.backToMonitoring('Claude เริ่มทำงานพอดีก่อนปิดเครื่อง จึงยังไม่ปิด');
+          return;
+        }
         await this.execute();
       } else if (result.aggregate === 'busy') {
         this.backToMonitoring('ตรวจซ้ำรอบสุดท้ายพบว่า Claude ยังทำงานอยู่ จึงยังไม่ปิดเครื่อง');

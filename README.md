@@ -19,6 +19,14 @@
 - session ที่ busy แต่เงียบเกิน 45 นาทีโดยไม่เข้ากรณีข้างบน นับว่าเสร็จ
 - ถ้าตรวจไม่ได้ จะไม่ปิดเครื่อง
 
+## ข้อจำกัด
+
+- งานที่แยกตัวออกจาก Claude (`nohup ... &`, `Start-Process`, `docker run -d`) อยู่นอก process ของ session จึงมองไม่เห็น
+- ถ้า Claude รันแบบ admin แต่แอปนี้ไม่ใช่ admin อาจอ่าน command line ไม่ได้ แอปจะใช้สถานะ `shell` และเวลาเกิด process แทน
+- Claude ใน WSL หรือที่ใช้ `CLAUDE_CONFIG_DIR` อื่นจะไม่เห็น (ตั้ง "โฟลเดอร์ Claude" ได้ทีละที่)
+- อ่าน format ภายในของ Claude Code หลังอัปเดต Claude ให้รัน `npm run detect -- --full` เช็คว่ายังอ่านได้
+- ระหว่างเฝ้า แอปกันเครื่อง sleep (จอยังดับได้) แต่ถ้าพับจอหรือกดปุ่ม power เครื่องจะ sleep อยู่ดี
+
 ## Log
 
 เก็บใน SQLite ที่ `%APPDATA%\Claude Auto Shutdown\logs.sqlite` (ตาราง `events`: `id, at, level, message`) เก็บไว้ 30 วัน ข้อมูลที่เก่ากว่านั้นจะถูกลบตอนเปิดแอปและทุกชั่วโมง

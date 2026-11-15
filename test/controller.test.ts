@@ -6,25 +6,36 @@ import type { Aggregate, LogEntry, Settings } from '../src/shared/types';
 
 const MIN = 60_000;
 
-function harness(overrides: Partial<Settings> = {}, options: { dryRunForced?: boolean; actionResult?: ActionResult } = {}) {
+function harness(
+  overrides: Partial<Settings> = {},
+  options: { dryRunForced?: boolean; actionResult?: ActionResult; maxTickGapMs?: number; saveFails?: boolean } = {},
+) {
   let now = 1_000_000;
   let aggregate: Aggregate = 'busy';
   let idleSeconds = 100_000;
+  const scripted: Aggregate[] = [];
   const actions: boolean[] = [];
   const notifications: string[] = [];
   const preventSleep: boolean[] = [];
   const log: LogEntry[] = [];
+  const thoroughCalls: boolean[] = [];
   const deps: ControllerDeps = {
     now: () => now,
-    detect: async () => ({
-      at: now,
-      aggregate,
-      sessions: [],
-      error: aggregate === 'unknown' ? 'detector failed' : null,
-      claudeDir: 'C:\\claude',
-      usedProcessSnapshot: false,
-      durationMs: 0,
-    }),
+    // Like the real detector: a files-only check cannot verify idleness, so it is partial.
+    detect: async (_settings, thorough) => {
+      thoroughCalls.push(thorough);
+      const current = scripted.shift() ?? aggregate;
+      return {
+        at: now,
+        aggregate: current,
+        sessions: [],
+        error: current === 'unknown' ? 'detector failed' : null,
+        claudeDir: 'C:\\claude',
+        usedProcessSnapshot: false,
+        partial: !thorough && current !== 'busy' ? true : undefined,
+        durationMs: 0,
+      };
+    },
     runAction: async (_settings, dryRun) => {
       actions.push(dryRun);
       return options.actionResult ?? { ok: true, command: 'shutdown /s /f /t 0' };
@@ -33,10 +44,14 @@ function harness(overrides: Partial<Settings> = {}, options: { dryRunForced?: bo
     systemIdleSeconds: () => idleSeconds,
     setPreventSleep: (on) => preventSleep.push(on),
     notify: (title) => notifications.push(title),
-    saveSettings: () => {},
+    saveSettings: () => {
+      if (options.saveFails) throw new Error('EBUSY: file is locked');
+    },
     persistLog: (entry) => log.push(entry),
     onChange: () => {},
     defaultClaudeDir: 'C:\\claude',
+    // These tests jump the clock between ticks; the gap check gets its own test.
+    maxTickGapMs: options.maxTickGapMs ?? Number.POSITIVE_INFINITY,
   };
   const controller = new Controller(
     deps,
@@ -49,11 +64,16 @@ function harness(overrides: Partial<Settings> = {}, options: { dryRunForced?: bo
     notifications,
     preventSleep,
     log,
+    thoroughCalls,
     advance: (ms: number) => {
       now += ms;
     },
     set: (next: Aggregate) => {
       aggregate = next;
+    },
+    /** The next detections return these, in order, before falling back to set(). */
+    script: (...next: Aggregate[]) => {
+      scripted.push(...next);
     },
     setIdleSeconds: (seconds: number) => {
       idleSeconds = seconds;
@@ -218,6 +238,7 @@ test('dry run (setting or --dry-run) logs instead of acting and disarms', async 
 test('a failed action disarms and logs an error', async () => {
   const h = harness({ idleConfirmMinutes: 0, countdownMinutes: 0 }, { actionResult: { ok: false, command: 'shutdown /s /f /t 0', error: 'Access is denied.' } });
   await intoCountdown(h);
+  h.advance(MIN); // a real action always gets at least a minute of countdown
   h.controller.tick();
   await h.settle();
   assert.equal(h.controller.getPhase(), 'disarmed');
@@ -237,6 +258,82 @@ test('waking from sleep during the countdown restarts the confirmation', async (
   h.controller.onResume();
   assert.equal(h.controller.getPhase(), 'monitoring');
   assert.equal(h.controller.state().idleSince, null);
+});
+
+test('checks inspect processes only while armed, or when the user asks', async () => {
+  const h = harness();
+  await h.controller.poll(); // disarmed: files only
+  h.controller.arm();
+  await h.controller.poll(); // armed: thorough
+  h.controller.disarm('test');
+  await h.controller.poll({ thorough: true }); // "check now" while disarmed
+  assert.deepEqual(h.thoroughCalls, [false, true, true]);
+});
+
+test('a files-only idle result never starts the idle timer while armed', async () => {
+  const h = harness({ idleConfirmMinutes: 0 });
+  h.controller.arm();
+  h.set('idle');
+  await h.controller.poll({ thorough: false }); // e.g. a check started while still disarmed
+  assert.equal(h.controller.getPhase(), 'monitoring');
+  assert.equal(h.controller.state().idleSince, null);
+  await h.controller.poll();
+  assert.equal(h.controller.getPhase(), 'countdown');
+});
+
+test('a files-only busy result still counts (busy is busy)', async () => {
+  const h = harness({ idleConfirmMinutes: 0 });
+  await intoCountdown(h);
+  h.set('busy');
+  await h.controller.poll({ thorough: false });
+  assert.equal(h.controller.getPhase(), 'monitoring');
+});
+
+test('a real shutdown always gets at least one minute of countdown, even when set to 0', async () => {
+  const h = harness({ idleConfirmMinutes: 0, countdownMinutes: 0 });
+  await intoCountdown(h);
+  assert.equal(h.controller.state().countdownTotalMs, MIN);
+  h.advance(30_000);
+  h.controller.tick();
+  await h.settle();
+  assert.equal(h.actions.length, 0);
+  h.advance(30_000);
+  h.controller.tick();
+  await h.settle();
+  assert.deepEqual(h.actions, [false]);
+});
+
+test('a gap between ticks during the countdown (sleep, clock jump) restarts the confirmation', async () => {
+  const h = harness({ idleConfirmMinutes: 0 }, { maxTickGapMs: 5_000 });
+  await intoCountdown(h);
+  h.advance(1_000);
+  h.controller.tick();
+  assert.equal(h.controller.getPhase(), 'countdown');
+  h.advance(8 * 60 * MIN); // the lid was closed all night; timers fire before the resume event
+  h.controller.tick();
+  await h.settle();
+  assert.equal(h.controller.getPhase(), 'monitoring');
+  assert.equal(h.actions.length, 0);
+});
+
+test('the final check re-reads the session files right before acting', async () => {
+  const h = harness({ idleConfirmMinutes: 0, countdownMinutes: 1 });
+  await intoCountdown(h);
+  h.advance(MIN);
+  h.script('idle', 'busy'); // thorough final check says idle, then a turn starts
+  h.controller.tick();
+  await h.settle();
+  assert.equal(h.actions.length, 0);
+  assert.equal(h.controller.getPhase(), 'monitoring');
+  assert.deepEqual(h.thoroughCalls.slice(-2), [true, false]);
+});
+
+test('a settings file that cannot be saved still applies the change and logs a warning', () => {
+  const h = harness({}, { saveFails: true });
+  const s = h.controller.updateSettings({ countdownMinutes: 9 });
+  assert.equal(s.countdownMinutes, 9);
+  assert.equal(h.controller.getSettings().countdownMinutes, 9);
+  assert.ok(h.log.some((entry) => entry.level === 'warn' && entry.message.includes('EBUSY')));
 });
 
 test('updateSettings clamps values and ignores invalid ones', () => {

@@ -13,7 +13,7 @@ import {
   type SessionFile,
 } from './session';
 import { latestMtimeUnder, TranscriptInfoCache, TranscriptLocator, type TranscriptInfo } from './transcript';
-import { classifyDescendants, indexProcesses, processMatchesSession, sleepEndsAt } from './tree';
+import { classifyDescendants, indexProcesses, sessionIdentity, sleepEndsAt } from './tree';
 
 /** Tool processes count as active at or above this CPU use (% of one core)... */
 const TOOL_ACTIVE_CPU_PERCENT = 2;
@@ -50,6 +50,8 @@ export interface Detector {
 export interface DetectOptions {
   /** Inspect processes even when a session is clearly busy (for display). */
   forceSnapshot?: boolean;
+  /** Never inspect processes (display-only checks while disarmed): the result is marked partial. */
+  skipProcesses?: boolean;
 }
 
 export interface ClaudeDetectorOptions {
@@ -159,7 +161,7 @@ export class ClaudeDetector implements Detector {
     const live = files.filter((f) => this.pidAlive(f.pid));
     const now = this.now();
     const projectsDir = path.join(claudeDir, 'projects');
-    const activity = await Promise.all(live.map((f) => this.activityFor(projectsDir, f, now)));
+    const activity = await Promise.all(live.map((f) => this.activityFor(projectsDir, f, now, settings)));
 
     // Cheap pass from files only: one clearly busy session is enough to keep the machine on.
     const cheap = live.map((file, i) => evaluateSession({ file, ...activity[i]!, processes: null, now, settings }));
@@ -170,11 +172,16 @@ export class ClaudeDetector implements Detector {
       const sessions = cheapInfos();
       return finish(aggregateOf(sessions, fileError), sessions, fileError, false);
     }
+    if (detectOptions.skipProcesses && !detectOptions.forceSnapshot) {
+      // Display-only check: no PowerShell, so an idle verdict here is unverified.
+      const sessions = cheapInfos();
+      return { ...finish(aggregateOf(sessions, fileError), sessions, fileError, false), partial: true };
+    }
 
     const maxAgeMs = Math.max(3 * settings.pollIntervalSec * 1000, 120_000);
     let sample: { snapshot: ProcessSnapshot; usage: Map<string, ProcActivity> | null };
     try {
-      sample = await this.snapshotWithUsage(maxAgeMs);
+      sample = await this.snapshotWithUsage(maxAgeMs, live.map((f) => f.pid));
     } catch (error) {
       const sessions = cheapInfos();
       return finish(clearlyBusy ? 'busy' : 'unknown', sessions, (error as Error).message, false);
@@ -187,16 +194,37 @@ export class ClaudeDetector implements Detector {
     const sessions: SessionInfo[] = [];
     for (const [i, file] of live.entries()) {
       const proc = index.byPid.get(file.pid);
-      if (!processMatchesSession(file, proc)) continue; // left behind by a process that has exited
-      const { tools, helpers } = classifyDescendants(index, proc);
-      const helperCpuPercent = usage ? helpers.reduce((sum, p) => sum + (usage.get(procKey(p))?.cpuPercent ?? 0), 0) : null;
+      const identity = sessionIdentity(file, proc);
+      if (identity === 'stale' || !proc) continue; // left behind by a process that has exited
+      if (identity === 'unsure') {
+        // Never guess idle about a live session we cannot pin down.
+        const unsure: Evaluation = {
+          verdict: 'working',
+          blocksShutdown: true,
+          reason: 'ยืนยันไม่ได้ว่า process นี้เป็นของ session นี้ จึงยังไม่ปิดเครื่อง',
+          needsProcessCheck: false,
+        };
+        sessions.push(toInfo(file, activity[i]!, unsure, null));
+        continue;
+      }
+      const { tools, helpers, newestCreatedAt } = classifyDescendants(index, proc);
+      const rate = (p: ProcInfo): ProcActivity | undefined => usage?.get(procKey(p));
+      const helperCpuPercent = usage ? helpers.reduce((sum, p) => sum + (rate(p)?.cpuPercent ?? 0), 0) : null;
+      const helpersActiveNow = usage
+        ? helpers.some((p) => (rate(p)?.cpuPercent ?? 0) >= TOOL_ACTIVE_CPU_PERCENT || (rate(p)?.ioBytesPerSec ?? 0) >= TOOL_ACTIVE_IO_BYTES_PER_SEC)
+        : true;
+      const key = `${file.pid}:${file.procStart ?? ''}`;
       let toolsActiveAt: number | null = null;
+      let shellActiveAt: number | null = null;
       if (tools.length > 0) {
-        const key = `${file.pid}:${file.procStart ?? ''}`;
         watched.add(key);
         toolsActiveAt = await this.toolsActiveAt(key, file.sessionId, tools, usage, checkedAt, maxAgeMs);
+      } else if (file.status === 'shell' && helpers.length > 0) {
+        // Claude says a shell is running but none has a known marker: watch everything under it.
+        watched.add(`${key}:shell`);
+        shellActiveAt = await this.toolsActiveAt(`${key}:shell`, file.sessionId, helpers, usage, checkedAt, maxAgeMs);
       }
-      const processes: ProcessFacts = { tools, helperCpuPercent, toolsActiveAt };
+      const processes: ProcessFacts = { tools, helperCpuPercent, toolsActiveAt, newestChildAt: newestCreatedAt, helpersActiveNow, shellActiveAt };
       const evaluation = evaluateSession({ file, ...activity[i]!, processes, now: checkedAt, settings });
       sessions.push(toInfo(file, activity[i]!, evaluation, processes));
     }
@@ -224,12 +252,10 @@ export class ClaudeDetector implements Detector {
     return { files, unreadableLive };
   }
 
-  private async activityFor(projectsDir: string, file: SessionFile, now: number): Promise<SessionActivity> {
+  private async activityFor(projectsDir: string, file: SessionFile, now: number, settings: Settings): Promise<SessionActivity> {
     const transcript = await this.locator.locate(projectsDir, file.sessionId, file.cwd, now);
     let transcriptMtime: number | null = null;
     let info: TranscriptInfo = { state: 'unknown', pendingTools: [], scheduledWakeAt: null };
-    let sideActivityAt: number | null = null;
-    let runningSubagentAt: number | null = null;
     if (transcript) {
       try {
         const stats = await stat(transcript);
@@ -238,43 +264,68 @@ export class ClaudeDetector implements Detector {
       } catch {
         // removed between locate and stat
       }
-      const sessionDir = path.join(path.dirname(transcript), file.sessionId);
-      sideActivityAt = await latestMtimeUnder(sessionDir);
-      runningSubagentAt = await this.runningSubagentAt(sessionDir, now);
     }
+    const lastActivityAt = maxOf(transcriptMtime, file.statusUpdatedAt, file.updatedAt);
+
+    // The session folder (subagent transcripts, which can number in the hundreds) only matters
+    // once the turn is over, or when a busy turn has gone quiet long enough for the silence rule.
+    // Skip it while a turn is visibly active, which is most of the night.
+    const stalledMs = settings.stalledMinutes * 60_000;
+    const quietMs = lastActivityAt === null ? Number.POSITIVE_INFINITY : now - lastActivityAt;
+    const needFolder = file.status !== 'busy' || file.waitingFor !== undefined || (stalledMs > 0 && quietMs >= stalledMs);
+    const folder =
+      transcript && needFolder
+        ? await this.scanSessionFolder(path.join(path.dirname(transcript), file.sessionId), now, stalledMs)
+        : { latest: null, runningSubagentAt: null };
     return {
       transcriptState: info.state,
       pendingTools: info.pendingTools,
       scheduledWakeAt: info.scheduledWakeAt,
-      lastActivityAt: maxOf(transcriptMtime, file.statusUpdatedAt, file.updatedAt),
-      sideActivityAt,
-      runningSubagentAt,
+      lastActivityAt,
+      sideActivityAt: folder.latest,
+      runningSubagentAt: folder.runningSubagentAt,
     };
   }
 
-  /** Latest write among subagent transcripts that are still mid-turn, or null if none are. */
-  private async runningSubagentAt(sessionDir: string, now: number): Promise<number | null> {
-    const dir = path.join(sessionDir, 'subagents');
-    let names: string[];
-    try {
-      names = await readdir(dir);
-    } catch {
-      return null;
-    }
+  /**
+   * One pass over the session's side folder: its latest write, and the newest subagent
+   * transcript that is still mid-turn. tool-results/ is skipped (written during tool calls,
+   * when the session is busy anyway). Only subagents recent enough to matter are read.
+   */
+  private async scanSessionFolder(dir: string, now: number, stalledMs: number): Promise<{ latest: number | null; runningSubagentAt: number | null }> {
     let latest: number | null = null;
-    for (const name of names) {
-      if (!name.endsWith('.jsonl')) continue;
-      const file = path.join(dir, name);
+    const subagents: Array<{ file: string; mtimeMs: number; size: number }> = [];
+    const walk = async (folder: string, depth: number, inSubagents: boolean): Promise<void> => {
+      let entries;
       try {
-        const stats = await stat(file);
-        if (now - stats.mtimeMs > SUBAGENT_LOOKBACK_MS) continue;
-        const info = await this.transcripts.get(file, stats.mtimeMs, stats.size);
-        if (info.state === 'running' && (latest === null || stats.mtimeMs > latest)) latest = stats.mtimeMs;
+        entries = await readdir(folder, { withFileTypes: true });
       } catch {
-        // removed meanwhile
+        return;
       }
+      for (const entry of entries) {
+        const full = path.join(folder, entry.name);
+        if (entry.isDirectory()) {
+          if (depth > 0 && entry.name !== 'tool-results') await walk(full, depth - 1, inSubagents || entry.name === 'subagents');
+        } else if (entry.isFile()) {
+          try {
+            const stats = await stat(full);
+            if (latest === null || stats.mtimeMs > latest) latest = stats.mtimeMs;
+            if (inSubagents && entry.name.endsWith('.jsonl')) subagents.push({ file: full, mtimeMs: stats.mtimeMs, size: stats.size });
+          } catch {
+            // removed meanwhile
+          }
+        }
+      }
+    };
+    await walk(dir, 2, false);
+
+    const window = stalledMs > 0 ? Math.min(stalledMs, SUBAGENT_LOOKBACK_MS) : SUBAGENT_LOOKBACK_MS;
+    const recent = subagents.filter((s) => now - s.mtimeMs < window).sort((a, b) => b.mtimeMs - a.mtimeMs);
+    for (const s of recent) {
+      const info = await this.transcripts.get(s.file, s.mtimeMs, s.size);
+      if (info.state === 'running') return { latest, runningSubagentAt: s.mtimeMs };
     }
-    return latest;
+    return { latest, runningSubagentAt: null };
   }
 
   /**
@@ -334,19 +385,24 @@ export class ClaudeDetector implements Detector {
       } catch {
         dir = null;
       }
-      if (this.tempDirs.size > 500) this.tempDirs.clear();
+      this.tempDirs.delete(sessionId);
       this.tempDirs.set(sessionId, { dir, checkedAt: now });
+      if (this.tempDirs.size > 500) this.tempDirs.delete(this.tempDirs.keys().next().value!);
     }
-    return dir ? latestMtimeUnder(dir, 2) : null;
+    // Background task output lives in tasks/; the rest of the folder is not needed.
+    return dir ? latestMtimeUnder(path.join(dir, 'tasks'), 0) : null;
   }
 
   /** Takes a snapshot; if there is no recent one to compare with, takes a second one 2 s later. */
-  private async snapshotWithUsage(maxAgeMs: number): Promise<{ snapshot: ProcessSnapshot; usage: Map<string, ProcActivity> | null }> {
-    let snapshot = await this.options.snapshotter.take();
+  private async snapshotWithUsage(
+    maxAgeMs: number,
+    roots: readonly number[],
+  ): Promise<{ snapshot: ProcessSnapshot; usage: Map<string, ProcActivity> | null }> {
+    let snapshot = await this.options.snapshotter.take(roots);
     let usage = this.sampler.update(snapshot, maxAgeMs);
     if (!usage) {
       await this.sleep(2_000);
-      snapshot = await this.options.snapshotter.take();
+      snapshot = await this.options.snapshotter.take(roots);
       usage = this.sampler.update(snapshot, maxAgeMs);
     }
     return { snapshot, usage };

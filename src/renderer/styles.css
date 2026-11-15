@@ -133,16 +133,6 @@ body {
   box-shadow: 0 0 0 4px color-mix(in srgb, var(--tone) 18%, transparent);
 }
 
-.hero[data-tone='busy'] .phase::before {
-  animation: pulse 2.4s ease-in-out infinite;
-}
-
-@keyframes pulse {
-  50% {
-    box-shadow: 0 0 0 7px color-mix(in srgb, var(--tone) 5%, transparent);
-  }
-}
-
 .timer {
   margin-top: 2px;
   font-size: 72px;
@@ -162,11 +152,11 @@ body {
   overflow: hidden;
 }
 
+/* No transitions or infinite animations: they keep the page repainting all the time. */
 #progressBar {
   height: 100%;
   width: 0;
   background: var(--tone);
-  transition: width 0.9s linear;
 }
 
 .phase-sub {

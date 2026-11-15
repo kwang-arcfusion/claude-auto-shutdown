@@ -8,8 +8,10 @@ import {
   Notification,
   powerMonitor,
   powerSaveBlocker,
+  session,
   shell,
   Tray,
+  type IpcMainInvokeEvent,
   type MenuItemConstructorOptions,
   type NativeImage,
 } from 'electron';
@@ -22,6 +24,7 @@ import { Controller } from './controller';
 import { ClaudeDetector, defaultClaudeDir, resolveClaudeDir, type Detector } from './detector/claude';
 import { PowerShellSnapshotter } from './detector/processes';
 import { renderAppIcon, type Rgb } from './icon';
+import { KeepAwake } from './keep-awake';
 import { openLogStore } from './log-store';
 import { loadSettings, saveSettings } from './storage';
 
@@ -33,25 +36,26 @@ const flagValue = (name: string): string | undefined => {
   return argv.find((arg) => arg.startsWith(prefix))?.slice(prefix.length);
 };
 
-/** Never runs the real action; only logs it. */
-const DRY_RUN_FORCED = hasFlag('dry-run');
-/** Starts with the window hidden in the tray. */
+/** Starts in the tray without a window. */
 const START_HIDDEN = hasFlag('hidden');
 // Test hooks.
 const SMOKE = hasFlag('smoke'); // print one detection as JSON and exit
 const CAPTURE_FILE = flagValue('capture'); // save a screenshot of the window
 const CAPTURE_DELAY_MS = Number(flagValue('capture-delay') ?? 2500);
 const EXIT_AFTER_MS = flagValue('exit-after') !== undefined ? Number(flagValue('exit-after')) : null;
-const AUTO_ARM = hasFlag('auto-arm');
 const USER_DATA = flagValue('user-data');
 const EXPAND = hasFlag('expand'); // open the collapsed sections before capturing
-// A fake detector is honoured only together with --dry-run, so it can never shut the machine down.
-const FAKE_DETECTOR = DRY_RUN_FORCED ? flagValue('fake-detector') : undefined;
+const FAKE_DETECTOR = flagValue('fake-detector');
 const TEST_MODE = SMOKE || CAPTURE_FILE !== undefined || EXIT_AFTER_MS !== null || FAKE_DETECTOR !== undefined;
+/** Never runs the real action; only logs it. Every test flag implies it, so a test run can never shut the PC down. */
+const DRY_RUN_FORCED = hasFlag('dry-run') || TEST_MODE;
+const AUTO_ARM = hasFlag('auto-arm') && DRY_RUN_FORCED;
 
 if (USER_DATA) app.setPath('userData', path.resolve(USER_DATA));
 else if (TEST_MODE) app.setPath('userData', path.join(os.tmpdir(), 'claude-auto-shutdown-test'));
 
+// A small static UI does not need the GPU; without it the app uses far less memory and CPU.
+app.disableHardwareAcceleration();
 app.setAppUserModelId('local.claude-auto-shutdown');
 
 if (!TEST_MODE && !app.requestSingleInstanceLock()) {
@@ -113,6 +117,9 @@ const TRAY_TEXT: Record<string, string> = {
   executing: 'กำลังปิดเครื่อง',
 };
 
+/** A crashed UI is reloaded, but not more often than this (avoids a crash loop). */
+const RELOAD_BACKOFF_MS = 30_000;
+
 function main(): void {
   const userData = app.getPath('userData');
   const settingsFile = path.join(userData, 'settings.json');
@@ -124,10 +131,16 @@ function main(): void {
   let quitting = false;
   let blockerId: number | null = null;
   let pollTimer: NodeJS.Timeout | null = null;
+  let pollThoroughly = false;
   let trayKey = '';
   let onTop = false;
   let toldAboutTray = false;
+  let lastReloadAt = 0;
   const icons = new Map<string, NativeImage>();
+
+  // Unattended overnight: log unexpected errors and keep going, never block on an error dialog.
+  process.on('uncaughtException', (error) => reportError('ข้อผิดพลาดที่ไม่คาดคิด', error));
+  process.on('unhandledRejection', (reason) => reportError('ข้อผิดพลาดที่ไม่คาดคิด', reason));
 
   const detector: Detector = FAKE_DETECTOR
     ? fakeDetector(FAKE_DETECTOR)
@@ -139,7 +152,7 @@ function main(): void {
   const controller: Controller = new Controller(
     {
       now: Date.now,
-      detect: (settings) => detector.detect(settings),
+      detect: (settings, thorough) => detector.detect(settings, { skipProcesses: !thorough }),
       runAction: async (settings, dryRun) => {
         const command = buildActionCommand(settings.action, settings.forceCloseApps);
         if (dryRun) return { ok: true, command: command.display };
@@ -158,7 +171,22 @@ function main(): void {
     loadSettings(settingsFile),
     DRY_RUN_FORCED,
   );
-  if (logs.store) controller.restoreLog(logs.store.recent(100));
+  try {
+    if (logs.store) controller.restoreLog(logs.store.recent(100));
+  } catch (error) {
+    reportError('อ่าน log เก่าไม่สำเร็จ', error); // never stop start-up over old log entries
+  }
+  const keepAwake = new KeepAwake(userData, (message) => controller.addLog('warn', message));
+
+  function reportError(where: string, error: unknown): void {
+    const message = error instanceof Error ? error.message : String(error);
+    try {
+      controller.addLog('error', `${where}: ${message}`);
+    } catch {
+      // the controller may not exist yet
+    }
+    process.stderr.write(`${where}: ${error instanceof Error ? (error.stack ?? message) : message}\n`);
+  }
 
   function iconFor(key: string): NativeImage {
     let image = icons.get(key);
@@ -175,12 +203,15 @@ function main(): void {
     return image;
   }
 
+  /** Keeps the PC awake while armed: this app stays runnable, and the system stays out of sleep. */
   function setPreventSleep(on: boolean): void {
     if (on && blockerId === null) {
       blockerId = powerSaveBlocker.start('prevent-app-suspension');
+      keepAwake.start();
     } else if (!on && blockerId !== null) {
       powerSaveBlocker.stop(blockerId);
       blockerId = null;
+      keepAwake.stop();
     }
   }
 
@@ -195,11 +226,15 @@ function main(): void {
   function pushState(): void {
     const state = controller.state();
     if (mainWindow && !mainWindow.isDestroyed()) {
-      mainWindow.webContents.send('state', state);
-      const wantOnTop = state.phase === 'countdown' && !TEST_MODE;
-      if (wantOnTop !== onTop) {
-        onTop = wantOnTop;
-        mainWindow.setAlwaysOnTop(wantOnTop);
+      try {
+        mainWindow.webContents.send('state', state);
+        const wantOnTop = state.phase === 'countdown' && !TEST_MODE;
+        if (wantOnTop !== onTop) {
+          onTop = wantOnTop;
+          mainWindow.setAlwaysOnTop(wantOnTop);
+        }
+      } catch {
+        // the window is going away; the next state push reaches the new one
       }
     }
     updateTray(state.phase, state.idleSince !== null);
@@ -226,7 +261,7 @@ function main(): void {
       { label: 'เปิดหน้าต่าง', click: showWindow },
       { type: 'separator' },
       toggle,
-      { label: 'ตรวจสถานะเดี๋ยวนี้', click: () => schedulePoll(0) },
+      { label: 'ตรวจสถานะเดี๋ยวนี้', click: () => schedulePoll(0, true) },
       { type: 'separator' },
       {
         label: 'ออกจากโปรแกรม',
@@ -243,7 +278,9 @@ function main(): void {
     schedulePoll(0);
   }
 
-  function schedulePoll(delayMs?: number): void {
+  /** Schedules the next check. thorough = also inspect processes even while disarmed (user asked). */
+  function schedulePoll(delayMs?: number, thorough = false): void {
+    if (thorough) pollThoroughly = true;
     if (pollTimer) clearTimeout(pollTimer);
     let ms = delayMs ?? controller.getSettings().pollIntervalSec * 1000;
     if (controller.getPhase() === 'countdown') ms = Math.min(ms, 15_000);
@@ -251,11 +288,16 @@ function main(): void {
     pollTimer = setTimeout(() => {
       pollTimer = null;
       controller.setNextPollAt(null);
-      void controller.poll().finally(() => schedulePoll());
+      const options = pollThoroughly ? { thorough: true } : {};
+      pollThoroughly = false;
+      controller
+        .poll(options)
+        .catch((error: unknown) => reportError('ตรวจสถานะไม่สำเร็จ', error))
+        .finally(() => schedulePoll());
     }, ms);
   }
 
-  function createWindow(show: boolean): BrowserWindow {
+  function createWindow(): BrowserWindow {
     const win = new BrowserWindow({
       width: 460,
       height: 680,
@@ -277,44 +319,52 @@ function main(): void {
     win.removeMenu();
     win.webContents.setWindowOpenHandler(() => ({ action: 'deny' }));
     win.webContents.on('will-navigate', (event) => event.preventDefault());
+    win.webContents.on('render-process-gone', (_event, details) => {
+      if (details.reason === 'clean-exit' || win.isDestroyed()) return;
+      controller.addLog('warn', `หน้าต่างหยุดทำงาน (${details.reason})`);
+      if (Date.now() - lastReloadAt > RELOAD_BACKOFF_MS) {
+        lastReloadAt = Date.now();
+        win.reload();
+      }
+    });
     win.once('ready-to-show', () => {
-      if (!show) return;
       // Test runs must not grab focus from whoever is using the machine.
       if (TEST_MODE) win.showInactive();
       else win.show();
     });
-    win.on('close', (event) => {
+    win.on('close', () => {
       if (quitting || controller.getPhase() === 'disarmed') return;
-      // Closing while armed would silently stop the auto-shutdown, so hide to the tray instead.
-      event.preventDefault();
-      win.hide();
+      // Armed: the window goes away to free its memory; watching continues from the tray.
       if (!toldAboutTray) {
         toldAboutTray = true;
         notify('ยังเฝ้าอยู่ใน tray', 'คลิกไอคอนรูปปุ่ม power ที่มุมจอเพื่อเปิดหน้าต่างอีกครั้ง');
       }
     });
-    void win.loadFile(path.join(__dirname, 'renderer', 'index.html'));
+    win.on('closed', () => {
+      if (mainWindow === win) mainWindow = null;
+      onTop = false;
+    });
+    win.loadFile(path.join(__dirname, 'renderer', 'index.html')).catch((error: unknown) => reportError('เปิดหน้าต่างไม่สำเร็จ', error));
     return win;
   }
 
   function showWindow(): void {
     if (!mainWindow || mainWindow.isDestroyed()) {
-      mainWindow = createWindow(true);
+      mainWindow = createWindow();
       return;
     }
     if (mainWindow.isMinimized()) mainWindow.restore();
+    if (TEST_MODE) {
+      mainWindow.showInactive();
+      return;
+    }
     mainWindow.show();
     mainWindow.focus();
   }
 
   function revealForCountdown(): void {
-    if (!mainWindow || mainWindow.isDestroyed()) return;
-    if (TEST_MODE) {
-      mainWindow.showInactive();
-      return;
-    }
     showWindow();
-    mainWindow.flashFrame(true);
+    if (!TEST_MODE) mainWindow?.flashFrame(true);
   }
 
   async function capture(file: string): Promise<void> {
@@ -331,24 +381,32 @@ function main(): void {
     process.stdout.write(`captured ${file}\n`);
   }
 
-  // ---- IPC ----------------------------------------------------------------------
+  // ---- IPC: only the app's own window may call in ----------------------------------
+  const fromAppWindow = (event: IpcMainInvokeEvent): boolean =>
+    mainWindow !== null && !mainWindow.isDestroyed() && event.sender === mainWindow.webContents && (event.senderFrame?.url ?? '').startsWith('file:');
+  const handle = (channel: string, fn: (...args: unknown[]) => unknown): void => {
+    ipcMain.handle(channel, (event, ...args: unknown[]) => {
+      if (!fromAppWindow(event)) throw new Error(`rejected IPC call: ${channel}`);
+      return fn(...args);
+    });
+  };
   const isRecord = (value: unknown): value is Record<string, unknown> => value !== null && typeof value === 'object';
-  ipcMain.handle('state:get', () => controller.state());
-  ipcMain.handle('arm', () => arm());
-  ipcMain.handle('disarm', () => controller.disarm('ผู้ใช้กดหยุดเฝ้า'));
-  ipcMain.handle('cancel', () => controller.cancel());
-  ipcMain.handle('poll-now', () => schedulePoll(0));
-  ipcMain.handle('settings:update', (_event, patch: unknown) => {
+  handle('state:get', () => controller.state());
+  handle('arm', () => arm());
+  handle('disarm', () => controller.disarm('ผู้ใช้กดหยุดเฝ้า'));
+  handle('cancel', () => controller.cancel());
+  handle('poll-now', () => schedulePoll(0, true));
+  handle('settings:update', (patch) => {
     const settings = controller.updateSettings(isRecord(patch) ? (patch as Partial<Settings>) : {});
     schedulePoll(0);
     return settings;
   });
-  ipcMain.handle('settings:reset', () => {
+  handle('settings:reset', () => {
     const settings = controller.resetSettings();
     schedulePoll(0);
     return settings;
   });
-  ipcMain.handle('open-log-folder', async () => {
+  handle('open-log-folder', async () => {
     await shell.openPath(userData);
   });
 
@@ -373,38 +431,52 @@ function main(): void {
   app.on('before-quit', () => {
     quitting = true;
   });
-  app.on('window-all-closed', () => app.quit());
+  // While armed the app lives on in the tray without a window.
+  app.on('window-all-closed', () => {
+    if (quitting || controller.getPhase() === 'disarmed') app.quit();
+  });
   app.on('will-quit', () => logs.store?.close());
 
-  void app.whenReady().then(() => {
-    nativeTheme.themeSource = 'dark'; // the UI is dark only; this also darkens the title bar and native controls
-    Menu.setApplicationMenu(null);
-    tray = new Tray(iconFor('disarmed'));
-    tray.on('click', showWindow);
-    updateTray('disarmed', false);
-    mainWindow = createWindow(!START_HIDDEN);
+  app
+    .whenReady()
+    .then(() => {
+      nativeTheme.themeSource = 'dark'; // the UI is dark only; this also darkens the title bar and native controls
+      Menu.setApplicationMenu(null);
+      // The page needs no browser permissions (camera, location, notifications, ...).
+      session.defaultSession.setPermissionRequestHandler((_contents, _permission, callback) => callback(false));
+      session.defaultSession.setPermissionCheckHandler(() => false);
 
-    setInterval(() => controller.tick(), 1000);
-    setInterval(() => logs.store?.prune(), 60 * 60 * 1000); // keep only the last 30 days
-    powerMonitor.on('suspend', () => controller.addLog('info', 'เครื่องกำลังเข้าสู่ Sleep'));
-    powerMonitor.on('resume', () => {
-      controller.onResume();
+      tray = new Tray(iconFor('disarmed'));
+      tray.on('click', showWindow);
+      updateTray('disarmed', false);
+      if (!START_HIDDEN) mainWindow = createWindow();
+
+      setInterval(() => controller.tick(), 1000);
+      setInterval(() => logs.store?.prune(), 60 * 60 * 1000); // keep only the last 30 days
+      powerMonitor.on('suspend', () => controller.addLog('info', 'เครื่องกำลังเข้าสู่ Sleep'));
+      powerMonitor.on('resume', () => {
+        controller.onResume();
+        schedulePoll(0);
+      });
+
+      controller.addLog('info', `เปิดโปรแกรม${DRY_RUN_FORCED ? ' (บังคับโหมดทดสอบด้วย --dry-run)' : ''}`);
+      if (logs.error) controller.addLog('warn', `เปิดฐานข้อมูล log ไม่ได้: ${logs.error}`);
       schedulePoll(0);
-    });
-
-    controller.addLog('info', `เปิดโปรแกรม${DRY_RUN_FORCED ? ' (บังคับโหมดทดสอบด้วย --dry-run)' : ''}`);
-    if (logs.error) controller.addLog('warn', `เปิดฐานข้อมูล log ไม่ได้: ${logs.error}`);
-    schedulePoll(0);
-    if (AUTO_ARM) arm();
-    if (CAPTURE_FILE) setTimeout(() => void capture(CAPTURE_FILE), CAPTURE_DELAY_MS);
-    if (EXIT_AFTER_MS !== null) {
-      setTimeout(() => {
-        const log = controller.state().log.slice().reverse();
-        process.stdout.write(`${JSON.stringify({ phase: controller.getPhase(), log })}\n`);
-        quitting = true;
-        logs.store?.close();
-        app.exit(0);
-      }, EXIT_AFTER_MS);
-    }
-  });
+      if (AUTO_ARM) arm();
+      if (CAPTURE_FILE) {
+        setTimeout(() => {
+          capture(CAPTURE_FILE).catch((error: unknown) => reportError('capture', error));
+        }, CAPTURE_DELAY_MS);
+      }
+      if (EXIT_AFTER_MS !== null) {
+        setTimeout(() => {
+          const log = controller.state().log.slice().reverse();
+          process.stdout.write(`${JSON.stringify({ phase: controller.getPhase(), log })}\n`);
+          quitting = true;
+          logs.store?.close();
+          app.exit(0);
+        }, EXIT_AFTER_MS);
+      }
+    })
+    .catch((error: unknown) => reportError('เริ่มโปรแกรมไม่สำเร็จ', error));
 }

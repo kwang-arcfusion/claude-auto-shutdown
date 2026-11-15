@@ -98,7 +98,7 @@ function renderHero(s: AppState): void {
   let sub = '';
   let timer: string | null = null;
   let progress: number | null = null;
-  let button: { text: string; kind: string; run: () => void };
+  let button: { text: string; kind: string; run: () => void } | null;
 
   switch (s.phase) {
     case 'disarmed':
@@ -129,7 +129,7 @@ function renderHero(s: AppState): void {
       button = { text: 'หยุดเฝ้า', kind: 'ghost', run: () => void api?.disarm() };
       break;
     case 'countdown': {
-      const total = s.settings.countdownMinutes * 60_000;
+      const total = s.countdownTotalMs ?? s.settings.countdownMinutes * 60_000;
       const left = (s.countdownEndsAt ?? now) - now;
       tone = 'danger';
       label = `จะ${action}ใน`;
@@ -140,9 +140,10 @@ function renderHero(s: AppState): void {
       break;
     }
     case 'executing':
+      // shutdown /t 0 cannot be taken back, so there is nothing to cancel here.
       tone = 'danger';
       label = s.effectiveDryRun ? 'ทดสอบ: ถึงเวลาแล้ว' : `กำลัง${action}…`;
-      button = { text: 'ยกเลิก', kind: 'ghost', run: () => void api?.cancel() };
+      button = null;
       break;
   }
 
@@ -153,9 +154,12 @@ function renderHero(s: AppState): void {
   if (timer !== null) ui.bigTimer.textContent = timer;
   ui.progress.hidden = progress === null;
   if (progress !== null) ui.progressBar.style.width = `${Math.min(100, Math.max(0, progress * 100))}%`;
-  ui.primaryBtn.textContent = button.text;
-  ui.primaryBtn.className = `btn ${button.kind}`;
-  primaryAction = button.run;
+  ui.primaryBtn.hidden = button === null;
+  if (button) {
+    ui.primaryBtn.textContent = button.text;
+    ui.primaryBtn.className = `btn ${button.kind}`;
+  }
+  primaryAction = button?.run ?? null;
   ui.dryBadge.hidden = !s.effectiveDryRun;
 }
 
@@ -180,10 +184,14 @@ function sessionRow(session: SessionInfo): HTMLLIElement {
   return row;
 }
 
-function renderSessions(s: AppState): void {
+function renderLastCheck(s: AppState): void {
   const detection = s.lastDetection;
   ui.lastCheck.textContent = detection ? agoShort(detection.at) : '';
   ui.lastCheck.title = detection ? `ตรวจล่าสุด ${timeOf(detection.at)}` : '';
+}
+
+function renderSessions(s: AppState): void {
+  const detection = s.lastDetection;
   ui.detectError.hidden = !detection?.error;
   ui.detectError.textContent = detection?.error ?? '';
   const sessions = detection?.sessions ?? [];
@@ -235,17 +243,21 @@ function fillSettings(s: AppState): void {
   force.closest('.row')?.classList.toggle('disabled', force.disabled);
 }
 
-function render(): void {
-  if (!state) return;
+/** Every second, only what changes with time (timers, "x minutes ago"); nothing while hidden. */
+function tick(): void {
+  if (!state || document.hidden) return;
   renderHero(state);
-  renderSessions(state);
+  renderLastCheck(state);
 }
 
+/** On new state from the main process: everything, including the session list and the log. */
 function applyState(next: AppState): void {
   state = next;
   fillSettings(next);
   renderLog(next);
-  render();
+  renderSessions(next);
+  renderHero(next);
+  renderLastCheck(next);
 }
 
 function flashSaved(): void {
@@ -262,7 +274,8 @@ if (!api) {
   const bridge = api;
   void bridge.getState().then(applyState);
   bridge.onState(applyState);
-  setInterval(render, 1000);
+  setInterval(tick, 1000);
+  document.addEventListener('visibilitychange', tick);
 
   ui.primaryBtn.addEventListener('click', () => primaryAction?.());
   ui.pollBtn.addEventListener('click', () => void bridge.pollNow());

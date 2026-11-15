@@ -4,7 +4,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { test } from 'node:test';
 import { ClaudeDetector } from '../src/main/detector/claude';
-import type { ProcInfo, ProcessSnapshot } from '../src/main/detector/processes';
+import type { ProcInfo, ProcessSnapshot, SnapshotSource } from '../src/main/detector/processes';
 import { msToFiletime } from '../src/main/detector/tree';
 import { DEFAULT_SETTINGS } from '../src/shared/settings';
 import type { DetectionResult } from '../src/shared/types';
@@ -69,7 +69,7 @@ const child = (pid: number, ppid: number, name: string, cmd: string, created = 6
   cmd,
 });
 
-function detector(dir: string, snapshotter: { take(): Promise<ProcessSnapshot> }, alive: number[]): ClaudeDetector {
+function detector(dir: string, snapshotter: SnapshotSource, alive: number[]): ClaudeDetector {
   return new ClaudeDetector({
     claudeDir: () => dir,
     snapshotter,
@@ -146,13 +146,39 @@ test('an idle session with a background tool shell keeps the machine on', async 
 test('session files left by exited or replaced processes are ignored', async () => {
   const dir = claudeDir([
     { pid: 11, sessionId: 'dead', status: 'busy', procStart: '5000', statusUpdatedAt: Date.now() },
-    // Busy but silent for 3 hours, and PID 12 now belongs to a process created much later.
+    // Busy but silent for 3 hours, and PID 12 now belongs to a process started just now.
     { pid: 12, sessionId: 'reused', status: 'busy', procStart: '5000', statusUpdatedAt: Date.now() - 3 * HOUR },
   ]);
-  const snap = new FakeSnapshotter(() => [claudeProc(12, 99_000_000_000)]);
+  const snap = new FakeSnapshotter(() => [claudeProc(12, msToFiletime(Date.now()))]);
   const r = await detector(dir, snap, [12]).detect(settings);
   assert.equal(r.aggregate, 'idle');
   assert.equal(r.sessions.length, 0);
+});
+
+test('a live session whose process identity does not add up keeps the PC on (never guessed idle)', async () => {
+  // procStart does not match, yet the process is older than the file: no evidence of PID reuse.
+  const dir = claudeDir([{ pid: 11, sessionId: 'a', status: 'idle', procStart: '5000', statusUpdatedAt: Date.now() }]);
+  const r = await detector(dir, new FakeSnapshotter(() => [claudeProc(11, 99_000_000_000)]), [11]).detect(settings);
+  assert.equal(r.aggregate, 'busy');
+  assert.match(r.sessions[0]!.reason, /ยืนยันไม่ได้/);
+});
+
+test('status "shell" with a shell we do not recognise: judged by its I/O, then hung once it is quiet', async () => {
+  const dir = claudeDir([{ pid: 11, sessionId: 'a', status: 'shell', procStart: '5000', statusUpdatedAt: START }]);
+  let io = 0;
+  const download = (): ProcInfo => ({ ...child(21, 11, 'bash.exe', 'bash.exe -c "curl -O big.iso"'), ioBytes: io });
+  const { state, d, pollFor } = clocked(dir, () => [claudeProc(11), download()], [11]);
+  let r = await d.detect(settings);
+  for (let i = 0; i < 40; i++) {
+    io += 1_000_000; // about 33 KB/s
+    state.clock += 30_000;
+    r = await d.detect(settings);
+  }
+  assert.equal(r.sessions[0]!.verdict, 'tool');
+  assert.equal(r.aggregate, 'busy');
+  r = await pollFor(21); // finished, but the shell stays open doing nothing
+  assert.equal(r.sessions[0]!.verdict, 'stalled');
+  assert.equal(r.aggregate, 'idle');
 });
 
 test('a missing sessions folder gives unknown', async () => {
@@ -191,6 +217,68 @@ test('without a status field the transcript decides', async () => {
   const dirEnded = claudeDir([{ pid: 11, sessionId: 'c', procStart: '5000', cwd: 'C:\\work\\app' }], { c: [running, ended] });
   const idle = await detector(dirEnded, new FakeSnapshotter(() => [claudeProc(11)]), [11]).detect(settings);
   assert.equal(idle.aggregate, 'idle');
+});
+
+// ---- cost control -------------------------------------------------------------------------
+
+test('files-only checks never take a process snapshot and mark an unverified idle result as partial', async () => {
+  const snap = new FakeSnapshotter(() => [claudeProc(11)]);
+  const idleDir = claudeDir([{ pid: 11, sessionId: 'a', status: 'idle', procStart: '5000', statusUpdatedAt: Date.now() }]);
+  const idle = await detector(idleDir, snap, [11]).detect(settings, { skipProcesses: true });
+  assert.equal(snap.calls, 0);
+  assert.equal(idle.partial, true);
+  assert.equal(idle.aggregate, 'idle');
+
+  // A clearly busy session needs no process check, so that result is complete.
+  const busyDir = claudeDir([{ pid: 11, sessionId: 'a', status: 'busy', procStart: '5000', statusUpdatedAt: Date.now() }]);
+  const busy = await detector(busyDir, snap, [11]).detect(settings, { skipProcesses: true });
+  assert.equal(busy.partial, undefined);
+  assert.equal(busy.aggregate, 'busy');
+});
+
+test('the process snapshot is asked only for the live session processes', async () => {
+  const now = Date.now();
+  const dir = claudeDir([
+    { pid: 11, sessionId: 'a', status: 'idle', procStart: '5000', statusUpdatedAt: now },
+    { pid: 12, sessionId: 'b', status: 'idle', procStart: '5000', statusUpdatedAt: now },
+    { pid: 13, sessionId: 'dead', status: 'idle', procStart: '5000', statusUpdatedAt: now },
+  ]);
+  const asked: number[][] = [];
+  let calls = 0;
+  const snap = {
+    take: async (roots: readonly number[]): Promise<ProcessSnapshot> => {
+      asked.push([...roots].sort());
+      return { at: 1_000_000 + ++calls * 2_000, procs: [claudeProc(11), claudeProc(12)] };
+    },
+  };
+  await detector(dir, snap, [11, 12]).detect(settings);
+  assert.deepEqual(asked[0], [11, 12]);
+});
+
+test('hundreds of finished subagents and fresh tool-results do not count; one running subagent does', async () => {
+  const done = JSON.stringify({ type: 'system', subtype: 'stop_hook_summary' });
+  const dir = claudeDir([{ pid: 11, sessionId: 's', status: 'idle', procStart: '5000', cwd: 'C:\\work\\app', statusUpdatedAt: START }], { s: [done] });
+  const sessionDir = path.join(dir, 'projects', 'C--work-app', 's');
+  const subagents = path.join(sessionDir, 'subagents');
+  mkdirSync(subagents, { recursive: true });
+  const ended = JSON.stringify({ type: 'assistant', message: { stop_reason: 'end_turn', content: [] } });
+  for (let i = 0; i < 300; i++) {
+    const file = path.join(subagents, `agent-${i}.jsonl`);
+    writeFileSync(file, `${ended}\n`);
+    utimesSync(file, new Date(START - 20 * MIN), new Date(START - 20 * MIN));
+  }
+  mkdirSync(path.join(sessionDir, 'tool-results'));
+  const toolResult = path.join(sessionDir, 'tool-results', 'out.txt');
+  writeFileSync(toolResult, 'large tool output');
+  utimesSync(toolResult, new Date(START - 10_000), new Date(START - 10_000)); // 10 s ago
+  const { state, d } = clocked(dir, () => [claudeProc(11)], [11]);
+  assert.equal((await d.detect(settings)).aggregate, 'idle');
+
+  const live = path.join(subagents, 'agent-live.jsonl');
+  writeFileSync(live, `${JSON.stringify({ type: 'user', message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'x', content: 'ok' }] } })}\n`);
+  utimesSync(live, new Date(START - 10 * MIN), new Date(START - 10 * MIN));
+  state.clock += 30_000;
+  assert.equal((await d.detect(settings)).sessions[0]!.verdict, 'background');
 });
 
 // ---- hung, quiet and sleeping background commands -----------------------------------------

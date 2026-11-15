@@ -3,7 +3,14 @@ import { mkdtempSync, statSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { test } from 'node:test';
-import { analyzeTranscriptLines, classifyTranscriptLines, projectSlug, readTranscriptState } from '../src/main/detector/transcript';
+import { rmSync } from 'node:fs';
+import {
+  analyzeTranscriptLines,
+  classifyTranscriptLines,
+  projectSlug,
+  readTranscriptState,
+  TranscriptInfoCache,
+} from '../src/main/detector/transcript';
 
 const line = (entry: object): string => JSON.stringify(entry);
 const user = (content: unknown, extra: object = {}): string => line({ type: 'user', message: { role: 'user', content }, ...extra });
@@ -94,6 +101,27 @@ test('ScheduleWakeup sets the wake-up time; stop: true cancels it', () => {
     toolResult('w2', 10),
   ]);
   assert.equal(stopped.scheduledWakeAt, null);
+});
+
+test('TranscriptInfoCache evicts only the least recently used entry when full', async () => {
+  const dir = mkdtempSync(path.join(os.tmpdir(), 'cas-cache-'));
+  const files = ['a', 'b', 'c'].map((name) => {
+    const file = path.join(dir, `${name}.jsonl`);
+    writeFileSync(file, `${assistant('end_turn')}\n`);
+    return file;
+  });
+  const [a, b, c] = files as [string, string, string];
+  const size = statSync(a).size;
+  const cache = new TranscriptInfoCache(2);
+  await cache.get(a, 1, size);
+  await cache.get(b, 1, size);
+  await cache.get(a, 1, size); // a is now the most recent
+  await cache.get(c, 1, size); // evicts b, keeps a
+  assert.equal(cache.size, 2);
+  rmSync(a);
+  rmSync(b);
+  assert.equal((await cache.get(a, 1, size)).state, 'ended'); // served from the cache
+  await assert.rejects(cache.get(b, 1, size)); // evicted, so it has to read the (deleted) file
 });
 
 test('projectSlug matches Claude Code project folder names', () => {

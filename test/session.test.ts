@@ -172,6 +172,37 @@ test('with waitingMinutes = 0 an unanswered prompt falls back to the long silenc
   assert.equal(fiftyMin.verdict, 'stalled');
 });
 
+test('a pending Bash call is running, not waiting, when anything started after it or helpers are busy', () => {
+  const bash = [pending('Bash', 3 * MIN)];
+  // A shell without a known marker (or unreadable command lines) still shows up by creation time.
+  const startedAfter = evaluateSession(input({ status: 'busy' }, { pendingTools: bash, processes: facts({ newestChildAt: NOW - 3 * MIN + 500 }) }));
+  assert.equal(startedAfter.verdict, 'working');
+  const startedBefore = evaluateSession(input({ status: 'busy' }, { pendingTools: bash, processes: facts({ newestChildAt: NOW - 60 * MIN }) }));
+  assert.equal(startedBefore.verdict, 'waiting');
+  const helpersBusy = evaluateSession(input({ status: 'busy' }, { pendingTools: bash, processes: facts({ helpersActiveNow: true }) }));
+  assert.equal(helpersBusy.verdict, 'working');
+});
+
+// ---- status "shell" (Claude Code says a shell is still running) --------------------------
+
+test('status "shell" without a recognised tool: active descendants block, quiet ones count as hung', () => {
+  const active = evaluateSession(input({ status: 'shell' }, { processes: facts({ shellActiveAt: NOW - 2 * MIN }) }));
+  assert.equal(active.verdict, 'tool');
+  assert.equal(active.blocksShutdown, true);
+  const quiet = evaluateSession(input({ status: 'shell' }, { processes: facts({ shellActiveAt: NOW - 21 * MIN }) }));
+  assert.equal(quiet.verdict, 'stalled');
+  assert.equal(quiet.blocksShutdown, false);
+
+  // Nothing under the session to measure: the long-silence rule decides.
+  assert.equal(evaluateSession(input({ status: 'shell' }, { lastActivityAt: NOW - 10 * MIN })).verdict, 'tool');
+  assert.equal(evaluateSession(input({ status: 'shell' }, { lastActivityAt: NOW - 50 * MIN })).verdict, 'stalled');
+
+  // Without a process check it cannot tell: it blocks and asks for one.
+  const unchecked = evaluateSession(input({ status: 'shell' }, { processes: null }));
+  assert.equal(unchecked.blocksShutdown, true);
+  assert.equal(unchecked.needsProcessCheck, true);
+});
+
 // ---- long silence -----------------------------------------------------------------------
 
 test('busy but silent past stalledMinutes counts as finished once processes are checked', () => {
@@ -222,4 +253,12 @@ test('recent writes in the session folder keep an idle session busy for a short 
 test('helper CPU above the threshold keeps an idle session busy', () => {
   const r = evaluateSession(input({ status: 'idle' }, { processes: facts({ helperCpuPercent: 12 }) }));
   assert.equal(r.verdict, 'background');
+});
+
+test('helper CPU keeps a finished turn on only for toolStallMinutes, and a silent turn for at most 3 hours', () => {
+  const busyHelpers = facts({ helperCpuPercent: 30 });
+  assert.equal(evaluateSession(input({ status: 'idle', statusUpdatedAt: NOW - 5 * MIN }, { processes: busyHelpers })).verdict, 'background');
+  assert.equal(evaluateSession(input({ status: 'idle', statusUpdatedAt: NOW - 25 * MIN }, { processes: busyHelpers })).verdict, 'idle');
+  assert.equal(evaluateSession(input({ status: 'busy' }, { lastActivityAt: NOW - 2 * 60 * MIN, processes: busyHelpers })).blocksShutdown, true);
+  assert.equal(evaluateSession(input({ status: 'busy' }, { lastActivityAt: NOW - 4 * 60 * MIN, processes: busyHelpers })).verdict, 'stalled');
 });

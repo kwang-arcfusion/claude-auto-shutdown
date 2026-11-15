@@ -9,9 +9,11 @@ export interface ActionCommand {
   display: string;
 }
 
+// SetSuspendState returns false when it cannot sleep (e.g. no S3 on a Modern Standby PC):
+// exit 1 then, so the failure is reported instead of logged as success.
 const SLEEP_SCRIPT =
   'Add-Type -AssemblyName System.Windows.Forms; ' +
-  '[void][System.Windows.Forms.Application]::SetSuspendState([System.Windows.Forms.PowerState]::Suspend, $false, $false)';
+  'if (-not [System.Windows.Forms.Application]::SetSuspendState([System.Windows.Forms.PowerState]::Suspend, $false, $false)) { exit 1 }';
 
 export function buildActionCommand(
   action: ActionKind,
