@@ -10,6 +10,15 @@ Shuts Windows down automatically once Claude Code (in the Claude desktop app or 
 
 During the countdown, the app cancels by itself if Claude starts working again or someone moves the mouse. Everything is adjustable under **Settings**, including the language: English (the default) or Thai.
 
+### Running in the background
+
+With **Run in background** on (the default), closing the window never quits the app. It stays in the tray, under the **^** arrow next to the clock:
+
+- Click its icon to open the window again. Starting the app again from the Desktop shortcut also brings the window back.
+- To quit, right-click the icon and choose **Quit**.
+
+With the setting off, closing the window quits the app, unless it is watching. While it runs in the background without watching, the app does not check Claude at all; checks resume when the window opens or watching starts.
+
 ## How detection works
 
 - Each session writes `%USERPROFILE%\.claude\sessions\<pid>.json` with the status `busy`, `idle` or `shell`. The app also checks that the session's process is really still running.

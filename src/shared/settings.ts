@@ -16,6 +16,7 @@ export const DEFAULT_SETTINGS: Readonly<Settings> = Object.freeze({
   backgroundCpuPercent: 5,
   claudeDir: '',
   language: 'en',
+  runInBackground: true,
 });
 
 export const LIMITS = {
@@ -61,5 +62,6 @@ export function sanitizeSettings(raw: unknown, base: Readonly<Settings> = DEFAUL
     backgroundCpuPercent: clampNumber(r.backgroundCpuPercent, base.backgroundCpuPercent, LIMITS.backgroundCpuPercent),
     claudeDir: typeof r.claudeDir === 'string' ? r.claudeDir.trim() : base.claudeDir,
     language: isLanguage(r.language) ? r.language : base.language,
+    runInBackground: bool(r.runInBackground, base.runInBackground),
   };
 }

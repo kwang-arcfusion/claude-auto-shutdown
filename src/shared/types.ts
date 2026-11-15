@@ -30,6 +30,8 @@ export interface Settings {
   claudeDir: string;
   /** Language of the window, tray, notifications and log. */
   language: Language;
+  /** Closing the window keeps the app in the tray even when not watching; quit from the tray menu. */
+  runInBackground: boolean;
 }
 
 export type TranscriptState = 'ended' | 'running' | 'unknown';

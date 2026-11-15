@@ -76,6 +76,11 @@ export class Controller {
     return this.settings;
   }
 
+  /** With its window closed, the app stays in the tray while armed, or always in background mode. */
+  keepsRunningWithoutWindow(): boolean {
+    return this.phase !== 'disarmed' || this.settings.runInBackground;
+  }
+
   get effectiveDryRun(): boolean {
     return this.dryRunForced || this.settings.dryRun;
   }

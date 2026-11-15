@@ -213,6 +213,8 @@ function main(): void {
   }
 
   function notify(title: Message, body: Message): void {
+    // A test run must not alarm whoever is using the PC (e.g. "Shutdown countdown started").
+    if (TEST_MODE) return;
     try {
       const lang = language();
       if (Notification.isSupported()) new Notification({ title: render(lang, title), body: render(lang, body), icon: appIconPath }).show();
@@ -281,6 +283,13 @@ function main(): void {
   function schedulePoll(delayMs?: number, thorough = false): void {
     if (thorough) pollThoroughly = true;
     if (pollTimer) clearTimeout(pollTimer);
+    pollTimer = null;
+    // Not watching and no window (running in the background): nothing needs the result, since the
+    // tray shows only the phase. Checks resume when the window opens or watching starts.
+    if (controller.getPhase() === 'disarmed' && !windowOpen() && !pollThoroughly) {
+      controller.setNextPollAt(null);
+      return;
+    }
     let ms = delayMs ?? controller.getSettings().pollIntervalSec * 1000;
     if (controller.getPhase() === 'countdown') ms = Math.min(ms, 15_000);
     controller.setNextPollAt(Date.now() + ms, ms);
@@ -333,11 +342,12 @@ function main(): void {
       else win.show();
     });
     win.on('close', () => {
-      if (quitting || controller.getPhase() === 'disarmed') return;
-      // Armed: the window goes away to free its memory; watching continues from the tray.
+      if (quitting || !controller.keepsRunningWithoutWindow()) return;
+      // The window goes away to free its memory; the app carries on in the tray, from where it
+      // is quit (the ^ arrow next to the clock, right-click, Quit).
       if (!toldAboutTray) {
         toldAboutTray = true;
-        notify(msg('notify.tray.title'), msg('notify.tray.body'));
+        notify(msg(controller.getPhase() === 'disarmed' ? 'notify.trayIdle.title' : 'notify.tray.title'), msg('notify.tray.body'));
       }
     });
     win.on('closed', () => {
@@ -348,9 +358,15 @@ function main(): void {
     return win;
   }
 
+  function windowOpen(): boolean {
+    return mainWindow !== null && !mainWindow.isDestroyed();
+  }
+
   function showWindow(): void {
     if (!mainWindow || mainWindow.isDestroyed()) {
       mainWindow = createWindow();
+      // Checks pause while not watching in the background; armed checks never stopped.
+      if (controller.getPhase() === 'disarmed') schedulePoll(0);
       return;
     }
     if (mainWindow.isMinimized()) mainWindow.restore();
@@ -433,7 +449,7 @@ function main(): void {
   });
   // While armed the app lives on in the tray without a window.
   app.on('window-all-closed', () => {
-    if (quitting || controller.getPhase() === 'disarmed') app.quit();
+    if (quitting || !controller.keepsRunningWithoutWindow()) app.quit();
   });
   app.on('will-quit', () => logs.store?.close());
 

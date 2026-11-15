@@ -51,7 +51,7 @@ const NUMBER_FIELDS = [
   'stalledMinutes',
   'backgroundCpuPercent',
 ] as const;
-const BOOLEAN_FIELDS = ['forceCloseApps', 'cancelOnUserActivity', 'preventSleepWhileArmed', 'dryRun'] as const;
+const BOOLEAN_FIELDS = ['runInBackground', 'forceCloseApps', 'cancelOnUserActivity', 'preventSleepWhileArmed', 'dryRun'] as const;
 
 /** Circumference of the countdown ring (r = 12 in index.html). */
 const RING_LENGTH = 2 * Math.PI * 12;

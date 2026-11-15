@@ -27,6 +27,9 @@ test('sanitizeSettings clamps numbers and falls back on invalid values', () => {
   assert.deepEqual(sanitizeSettings(null), { ...DEFAULT_SETTINGS });
   assert.equal(DEFAULT_SETTINGS.language, 'en');
   assert.equal(sanitizeSettings({ language: 'th' }).language, 'th');
+  assert.equal(DEFAULT_SETTINGS.runInBackground, true);
+  assert.equal(sanitizeSettings({ runInBackground: false }).runInBackground, false);
+  assert.equal(sanitizeSettings({ runInBackground: 'no' }).runInBackground, true);
   assert.equal(sanitizeSettings({ language: 'fr' }).language, 'en');
   assert.equal(sanitizeSettings({ language: 'fr' }, { ...DEFAULT_SETTINGS, language: 'th' }).language, 'th');
 });

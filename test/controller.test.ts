@@ -369,3 +369,15 @@ test('the next check time and the length of the wait are in the state (for the c
   assert.equal(s.nextPollAt, 1_030_000);
   assert.equal(s.nextPollTotalMs, 30_000);
 });
+
+test('with the window closed the app stays in the tray while watching, or always in background mode', () => {
+  const background = harness({ runInBackground: true });
+  assert.equal(background.controller.keepsRunningWithoutWindow(), true);
+
+  const foreground = harness({ runInBackground: false });
+  assert.equal(foreground.controller.keepsRunningWithoutWindow(), false); // not watching: closing quits
+  foreground.controller.arm();
+  assert.equal(foreground.controller.keepsRunningWithoutWindow(), true); // watching never stops on close
+  foreground.controller.cancel();
+  assert.equal(foreground.controller.keepsRunningWithoutWindow(), false);
+});
