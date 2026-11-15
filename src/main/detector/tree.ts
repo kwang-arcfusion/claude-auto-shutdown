@@ -1,0 +1,85 @@
+import type { ProcInfo } from './processes';
+
+/**
+ * Command-line markers of shells that Claude Code starts for its tools, including
+ * background tasks. Verified on Claude Code 2.1.325 for Windows:
+ *   Bash tool:       bash.exe -c "source ~/.claude/shell-snapshots/snapshot-bash-....sh ..."
+ *   PowerShell tool: cmd.exe /d /s /c "... powershell.exe ... $env:CLAUDE_CODE_SHELL_LAUNCHER_SCRIPT ..."
+ * MCP servers are also children of the session process but carry neither marker.
+ */
+export const TOOL_SIGNATURES: readonly RegExp[] = [/shell-snapshots[\\/]/i, /CLAUDE_CODE_SHELL_LAUNCHER_SCRIPT/i];
+
+/** Console hosts attached to console programs; never real work. */
+const IGNORED_NAMES = new Set(['conhost.exe']);
+
+export const isToolProcess = (p: ProcInfo): boolean => TOOL_SIGNATURES.some((re) => re.test(p.cmd));
+
+export interface ProcessIndex {
+  byPid: Map<number, ProcInfo>;
+  children: Map<number, ProcInfo[]>;
+}
+
+export function indexProcesses(procs: readonly ProcInfo[]): ProcessIndex {
+  const byPid = new Map<number, ProcInfo>();
+  const children = new Map<number, ProcInfo[]>();
+  for (const p of procs) {
+    byPid.set(p.pid, p);
+    if (p.ppid === p.pid) continue;
+    const siblings = children.get(p.ppid);
+    if (siblings) siblings.push(p);
+    else children.set(p.ppid, [p]);
+  }
+  return { byPid, children };
+}
+
+export interface Descendants {
+  /** Tool shells and everything running under them. */
+  tools: ProcInfo[];
+  /** Everything else under the session, e.g. MCP servers. */
+  helpers: ProcInfo[];
+}
+
+export function classifyDescendants(index: ProcessIndex, root: ProcInfo): Descendants {
+  const tools: ProcInfo[] = [];
+  const helpers: ProcInfo[] = [];
+  const seen = new Set<number>([root.pid]);
+  const stack: Array<{ proc: ProcInfo; inTool: boolean }> = [{ proc: root, inTool: false }];
+  while (stack.length > 0) {
+    const { proc: parent, inTool } = stack.pop()!;
+    for (const child of index.children.get(parent.pid) ?? []) {
+      if (seen.has(child.pid)) continue;
+      // Windows reuses PIDs: a "child" created before its parent belongs to an older process.
+      if (parent.created && child.created && child.created < parent.created) continue;
+      seen.add(child.pid);
+      if (IGNORED_NAMES.has(child.name.toLowerCase())) continue;
+      const tool = inTool || isToolProcess(child);
+      (tool ? tools : helpers).push(child);
+      stack.push({ proc: child, inTool: tool });
+    }
+  }
+  return { tools, helpers };
+}
+
+const FILETIME_UNIX_EPOCH_MS = 11_644_473_600_000;
+export const filetimeToMs = (filetime: number): number => filetime / 10_000 - FILETIME_UNIX_EPOCH_MS;
+
+/** 2 seconds in FILETIME ticks. */
+const PROC_START_TOLERANCE = 20_000_000;
+
+/**
+ * Whether `proc` is the process that wrote the session file, rather than a different
+ * process that later got the same PID.
+ */
+export function processMatchesSession(
+  file: { procStart?: string; startedAt?: number },
+  proc: ProcInfo | undefined,
+): proc is ProcInfo {
+  if (!proc) return false;
+  if (!proc.created) return true; // creation time unavailable: trust the PID
+  const expected = file.procStart ? Number(file.procStart) : Number.NaN;
+  if (Number.isFinite(expected) && expected > 0) return Math.abs(expected - proc.created) <= PROC_START_TOLERANCE;
+  // The process can start well before the session (the desktop app keeps spare processes),
+  // but never after it.
+  if (file.startedAt) return filetimeToMs(proc.created) <= file.startedAt + 5_000;
+  return true;
+}

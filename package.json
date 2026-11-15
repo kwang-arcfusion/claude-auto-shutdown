@@ -1,0 +1,26 @@
+{
+  "name": "claude-auto-shutdown",
+  "productName": "Claude Auto Shutdown",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Shuts Windows down automatically after Claude Code sessions finish.",
+  "main": "dist/main.js",
+  "scripts": {
+    "build": "node scripts/build.mjs",
+    "typecheck": "tsc -p tsconfig.json",
+    "test": "node --import tsx --test \"test/**/*.test.ts\"",
+    "start": "npm run build && electron .",
+    "start:dry": "npm run build && electron . --dry-run",
+    "detect": "tsx scripts/detect.ts",
+    "e2e": "npm run build && tsx scripts/e2e.ts",
+    "package": "npm run build && tsx scripts/package.ts"
+  },
+  "devDependencies": {
+    "@electron/packager": "20.3.0",
+    "@types/node": "22.20.5",
+    "electron": "45.3.2",
+    "esbuild": "0.28.2",
+    "tsx": "4.23.15",
+    "typescript": "7.0.2"
+  }
+}

@@ -1,0 +1,248 @@
+import assert from 'node:assert/strict';
+import { test } from 'node:test';
+import { Controller, type ActionResult, type ControllerDeps } from '../src/main/controller';
+import { DEFAULT_SETTINGS } from '../src/shared/settings';
+import type { Aggregate, LogEntry, Settings } from '../src/shared/types';
+
+const MIN = 60_000;
+
+function harness(overrides: Partial<Settings> = {}, options: { dryRunForced?: boolean; actionResult?: ActionResult } = {}) {
+  let now = 1_000_000;
+  let aggregate: Aggregate = 'busy';
+  let idleSeconds = 100_000;
+  const actions: boolean[] = [];
+  const notifications: string[] = [];
+  const preventSleep: boolean[] = [];
+  const log: LogEntry[] = [];
+  const deps: ControllerDeps = {
+    now: () => now,
+    detect: async () => ({
+      at: now,
+      aggregate,
+      sessions: [],
+      error: aggregate === 'unknown' ? 'detector failed' : null,
+      claudeDir: 'C:\\claude',
+      usedProcessSnapshot: false,
+      durationMs: 0,
+    }),
+    runAction: async (_settings, dryRun) => {
+      actions.push(dryRun);
+      return options.actionResult ?? { ok: true, command: 'shutdown /s /f /t 0' };
+    },
+    describeAction: () => 'shutdown /s /f /t 0',
+    systemIdleSeconds: () => idleSeconds,
+    setPreventSleep: (on) => preventSleep.push(on),
+    notify: (title) => notifications.push(title),
+    saveSettings: () => {},
+    persistLog: (entry) => log.push(entry),
+    onChange: () => {},
+    defaultClaudeDir: 'C:\\claude',
+  };
+  const controller = new Controller(
+    deps,
+    { ...DEFAULT_SETTINGS, idleConfirmMinutes: 10, countdownMinutes: 20, ...overrides },
+    options.dryRunForced ?? false,
+  );
+  return {
+    controller,
+    actions,
+    notifications,
+    preventSleep,
+    log,
+    advance: (ms: number) => {
+      now += ms;
+    },
+    set: (next: Aggregate) => {
+      aggregate = next;
+    },
+    setIdleSeconds: (seconds: number) => {
+      idleSeconds = seconds;
+    },
+    /** Lets fire-and-forget promises (the final check) finish. */
+    settle: async () => {
+      for (let i = 0; i < 10; i++) await new Promise((resolve) => setImmediate(resolve));
+    },
+  };
+}
+
+/** Arms and drives the controller into the countdown (needs idleConfirmMinutes: 0). */
+async function intoCountdown(h: ReturnType<typeof harness>): Promise<void> {
+  h.controller.arm();
+  h.set('idle');
+  await h.controller.poll();
+  assert.equal(h.controller.getPhase(), 'countdown');
+}
+
+test('never acts while disarmed', async () => {
+  const h = harness();
+  h.set('idle');
+  for (let i = 0; i < 10; i++) {
+    await h.controller.poll();
+    h.advance(30 * MIN);
+    h.controller.tick();
+  }
+  await h.settle();
+  assert.equal(h.controller.getPhase(), 'disarmed');
+  assert.equal(h.actions.length, 0);
+});
+
+test('full cycle: idle for the confirm window, then countdown, final check and action', async () => {
+  const h = harness();
+  h.controller.arm();
+  assert.equal(h.controller.getPhase(), 'monitoring');
+  assert.deepEqual(h.preventSleep, [true]);
+
+  h.set('idle');
+  await h.controller.poll();
+  h.advance(9 * MIN);
+  await h.controller.poll();
+  assert.equal(h.controller.getPhase(), 'monitoring');
+  h.advance(1 * MIN);
+  await h.controller.poll();
+  assert.equal(h.controller.getPhase(), 'countdown');
+  assert.equal(h.notifications.length, 1);
+
+  h.advance(19 * MIN);
+  h.controller.tick();
+  await h.settle();
+  assert.equal(h.actions.length, 0);
+
+  h.advance(1 * MIN);
+  h.controller.tick();
+  await h.settle();
+  assert.deepEqual(h.actions, [false]);
+  assert.equal(h.controller.getPhase(), 'executing');
+  assert.equal(h.preventSleep.at(-1), false); // our own blocker is released before acting
+});
+
+test('activity restarts the confirmation window', async () => {
+  const h = harness();
+  h.controller.arm();
+  h.set('idle');
+  await h.controller.poll();
+  h.advance(8 * MIN);
+  h.set('busy');
+  await h.controller.poll();
+  assert.equal(h.controller.state().idleSince, null);
+  h.set('idle');
+  h.advance(1 * MIN);
+  await h.controller.poll();
+  h.advance(9 * MIN);
+  await h.controller.poll();
+  assert.equal(h.controller.getPhase(), 'monitoring'); // only 9 minutes since the reset
+  h.advance(1 * MIN);
+  await h.controller.poll();
+  assert.equal(h.controller.getPhase(), 'countdown');
+});
+
+test('activity during the countdown goes back to monitoring', async () => {
+  const h = harness({ idleConfirmMinutes: 0 });
+  await intoCountdown(h);
+  h.set('busy');
+  await h.controller.poll();
+  assert.equal(h.controller.getPhase(), 'monitoring');
+  h.advance(30 * MIN);
+  h.controller.tick();
+  await h.settle();
+  assert.equal(h.actions.length, 0);
+});
+
+test('a final check that finds work does not act', async () => {
+  const h = harness({ idleConfirmMinutes: 0 });
+  await intoCountdown(h);
+  h.set('busy');
+  h.advance(20 * MIN);
+  h.controller.tick();
+  await h.settle();
+  assert.equal(h.controller.getPhase(), 'monitoring');
+  assert.equal(h.actions.length, 0);
+});
+
+test('unknown status keeps counting, but the final check must pass: three failures cancel', async () => {
+  const h = harness({ idleConfirmMinutes: 0 });
+  await intoCountdown(h);
+  h.set('unknown');
+  await h.controller.poll();
+  assert.equal(h.controller.getPhase(), 'countdown');
+  h.advance(20 * MIN);
+  for (let attempt = 0; attempt < 3; attempt++) {
+    h.controller.tick();
+    await h.settle();
+    h.advance(15_000);
+  }
+  assert.equal(h.controller.getPhase(), 'monitoring');
+  assert.equal(h.actions.length, 0);
+});
+
+test('mouse or keyboard input during the countdown disarms', async () => {
+  const h = harness({ idleConfirmMinutes: 0 });
+  await intoCountdown(h);
+  h.advance(10_000);
+  h.setIdleSeconds(1); // input 1 s ago, 10 s into the countdown
+  h.controller.tick();
+  assert.equal(h.controller.getPhase(), 'disarmed');
+  assert.equal(h.preventSleep.at(-1), false);
+});
+
+test('input from before the countdown started is ignored', async () => {
+  const h = harness({ idleConfirmMinutes: 0 });
+  await intoCountdown(h);
+  h.setIdleSeconds(3600);
+  h.advance(10_000);
+  h.controller.tick();
+  assert.equal(h.controller.getPhase(), 'countdown');
+});
+
+test('user activity is ignored when the setting is off', async () => {
+  const h = harness({ idleConfirmMinutes: 0, cancelOnUserActivity: false });
+  await intoCountdown(h);
+  h.advance(10_000);
+  h.setIdleSeconds(0);
+  h.controller.tick();
+  assert.equal(h.controller.getPhase(), 'countdown');
+});
+
+test('dry run (setting or --dry-run) logs instead of acting and disarms', async () => {
+  for (const variant of [{ overrides: { dryRun: true } }, { overrides: {}, dryRunForced: true }]) {
+    const h = harness({ idleConfirmMinutes: 0, countdownMinutes: 1, ...variant.overrides }, { dryRunForced: variant.dryRunForced });
+    await intoCountdown(h);
+    h.advance(1 * MIN);
+    h.controller.tick();
+    await h.settle();
+    assert.deepEqual(h.actions, [true]);
+    assert.equal(h.controller.getPhase(), 'disarmed');
+    assert.ok(h.log.some((entry) => entry.message.includes('[โหมดทดสอบ]')));
+  }
+});
+
+test('a failed action disarms and logs an error', async () => {
+  const h = harness({ idleConfirmMinutes: 0, countdownMinutes: 0 }, { actionResult: { ok: false, command: 'shutdown /s /f /t 0', error: 'Access is denied.' } });
+  await intoCountdown(h);
+  h.controller.tick();
+  await h.settle();
+  assert.equal(h.controller.getPhase(), 'disarmed');
+  assert.ok(h.log.some((entry) => entry.level === 'error' && entry.message.includes('Access is denied.')));
+});
+
+test('cancel during the countdown disarms', async () => {
+  const h = harness({ idleConfirmMinutes: 0 });
+  await intoCountdown(h);
+  h.controller.cancel();
+  assert.equal(h.controller.getPhase(), 'disarmed');
+});
+
+test('waking from sleep during the countdown restarts the confirmation', async () => {
+  const h = harness({ idleConfirmMinutes: 0 });
+  await intoCountdown(h);
+  h.controller.onResume();
+  assert.equal(h.controller.getPhase(), 'monitoring');
+  assert.equal(h.controller.state().idleSince, null);
+});
+
+test('updateSettings clamps values and ignores invalid ones', () => {
+  const h = harness();
+  const s = h.controller.updateSettings({ pollIntervalSec: 1, action: 'reboot' as never, countdownMinutes: 7 });
+  assert.equal(s.pollIntervalSec, 5);
+  assert.equal(s.action, 'shutdown');
+  assert.equal(s.countdownMinutes, 7);
+});
