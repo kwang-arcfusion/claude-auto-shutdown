@@ -494,3 +494,27 @@ test('time spent asleep is not silence: a quiet busy session just after waking i
   assert.equal((await d.detect(settings, { activeSince: Date.now() - 5 * MIN })).sessions[0]!.verdict, 'working');
 });
 
+
+test('a background polling loop keeps its own shell active; a later process is not covered by it', async () => {
+  const at = new Date(START).toISOString();
+  const lines = [
+    JSON.stringify({
+      type: 'assistant',
+      timestamp: at,
+      message: { stop_reason: 'tool_use', content: [{ type: 'tool_use', id: 't1', name: 'PowerShell', input: { command: 'do { Start-Sleep 30 } until (Test-Path C:\\ci\\done.txt)', run_in_background: true } }] },
+    }),
+    JSON.stringify({ type: 'user', timestamp: at, message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: 't1', content: 'Command running in background with ID: b1' }] } }),
+    JSON.stringify({ type: 'assistant', timestamp: at, message: { stop_reason: 'end_turn', content: [] } }),
+  ];
+  const dir = claudeDir([{ pid: 11, sessionId: 'a', status: 'idle', procStart: '5000', cwd: 'C:\\work\\app', statusUpdatedAt: START }], { a: lines });
+  const launcher = 'powershell.exe -Command "& ([scriptblock]::Create($env:CLAUDE_CODE_SHELL_LAUNCHER_SCRIPT))"';
+  let procs: ProcInfo[] = [claudeProc(11), child(21, 11, 'powershell.exe', launcher, msToFiletime(START))];
+  const { state, pollFor } = clocked(dir, () => procs, [11]);
+  // An hour of quiet polling (no CPU, no output): still a command Claude is waiting on.
+  assert.equal((await pollFor(60)).sessions[0]!.verdict, 'tool');
+
+  // The loop is done; a quiet process started later is judged on its own: hung after 20 minutes.
+  procs = [claudeProc(11), child(31, 11, 'bash.exe', BASH_TOOL, msToFiletime(state.clock))];
+  assert.equal((await pollFor(10)).sessions[0]!.verdict, 'tool');
+  assert.equal((await pollFor(12)).sessions[0]!.verdict, 'stalled');
+});

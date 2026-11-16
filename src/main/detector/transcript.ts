@@ -12,6 +12,28 @@ const CONTINUING_STOP_REASONS = new Set(['tool_use', 'pause_turn', 'max_tokens']
 const COMMAND_TOOLS = new Set(['Bash', 'PowerShell', 'Monitor']);
 /** Timed waits are trusted only this far (same limit as a running `sleep` process). */
 const MAX_TIMED_WAIT_SECONDS = 6 * 3600;
+/** A wait with no set length (a polling loop, `gh run watch`) counts as active this long at most. */
+export const MAX_OPEN_WAIT_SECONDS = 3 * 3600;
+
+/** A command that waits on purpose, from when it was called until it should be over (ms). */
+export interface TimedWait {
+  at: number;
+  endsAt: number;
+}
+
+/**
+ * Commands that wait on purpose for something without a set length: a loop that sleeps between
+ * checks (`while (...) { Start-Sleep 30 }`, `until [ -f x ]; do sleep 5; done`), `gh run watch`,
+ * `Wait-Process`, `Wait-Job`, `docker wait`, `kubectl wait`. They can sit still for a long
+ * time; Claude's own loops on this PC all had a deadline or a retry limit.
+ */
+export function openEndedWait(command: string): boolean {
+  // Loop keywords as code ("for (", "for x in", "while", "until", "do"), not "for" in a message.
+  const loop = /\b(?:while|until|do|foreach)\b|\bfor\s*\(|\bfor\s+\$?\w+\s+in\b/i.test(command);
+  const sleeps = /\bStart-Sleep\b|(?:^|[\s;&|(])sleep\s+\d|\btimeout(?:\.exe)?\s+[/-]t\s+\d|\btime\.sleep\(/i.test(command);
+  if (loop && sleeps) return true;
+  return /\bgh\s+run\s+watch\b|\bgh\s+pr\s+checks\b[^\n]*--watch\b|\bWait-Process\b|\bWait-Job\b|\bReceive-Job\b[^\n]*-Wait\b|\b(?:docker|podman)(?:\.exe)?\s+wait\b|\bkubectl\s+wait\b/i.test(command);
+}
 const SECONDS_PER_UNIT: Record<string, number> = { '': 1, s: 1, m: 60, h: 3600, d: 86400 };
 
 /**
@@ -126,8 +148,8 @@ export interface TranscriptInfo {
   pendingTools: PendingTool[];
   /** When the latest ScheduleWakeup call will wake the session (ms), unless the loop was stopped. */
   scheduledWakeAt: number | null;
-  /** When the latest timed wait in a command ends (ms): `Start-Sleep 3600` started then plus an hour. */
-  timedWaitEndsAt: number | null;
+  /** Commands that wait on purpose: `Start-Sleep 3600` called at T waits until T plus an hour. */
+  waits: TimedWait[];
   /** CronCreate jobs created and not deleted in the part that was read. */
   crons: CronJob[];
   /** Job ids deleted with CronDelete in the part that was read. */
@@ -140,7 +162,7 @@ export const emptyTranscriptInfo = (): TranscriptInfo => ({
   state: 'unknown',
   pendingTools: [],
   scheduledWakeAt: null,
-  timedWaitEndsAt: null,
+  waits: [],
   crons: [],
   deletedCrons: [],
   endedWithError: null,
@@ -152,7 +174,7 @@ export function analyzeTranscriptLines(lines: readonly string[]): TranscriptInfo
   const crons = new Map<string, CronJob>();
   const deletedCrons: string[] = [];
   let scheduledWakeAt: number | null = null;
-  let timedWaitEndsAt: number | null = null;
+  const waits: TimedWait[] = [];
   let lastError: string | null = null;
   for (const line of lines) {
     const entry = parseEntry(line);
@@ -179,8 +201,8 @@ export function analyzeTranscriptLines(lines: readonly string[]): TranscriptInfo
           crons.delete(input.id);
           deletedCrons.push(input.id);
         } else if (COMMAND_TOOLS.has(name) && typeof input.command === 'string' && at !== null) {
-          const seconds = timedWaitSeconds(input.command);
-          if (seconds > 0) timedWaitEndsAt = Math.max(timedWaitEndsAt ?? 0, at + seconds * 1000);
+          const seconds = Math.max(timedWaitSeconds(input.command), openEndedWait(input.command) ? MAX_OPEN_WAIT_SECONDS : 0);
+          if (seconds > 0) waits.push({ at, endsAt: at + seconds * 1000 });
         }
       }
     } else if (entry.type === 'user') {
@@ -203,7 +225,7 @@ export function analyzeTranscriptLines(lines: readonly string[]): TranscriptInfo
     state: classifyTranscriptLines(lines),
     pendingTools: [...pending.values()],
     scheduledWakeAt,
-    timedWaitEndsAt,
+    waits,
     crons: [...crons.values()],
     deletedCrons,
     endedWithError: lastError,

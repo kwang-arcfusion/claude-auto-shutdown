@@ -1,7 +1,7 @@
 import { msg, type Message, type MessageParams } from '../../shared/i18n';
 import type { SessionVerdict, Settings, TranscriptState } from '../../shared/types';
 import type { ProcInfo } from './processes';
-import type { PendingTool } from './transcript';
+import type { PendingTool, TimedWait } from './transcript';
 
 /**
  * `<claudeDir>/sessions/<pid>.json`, written by every running Claude Code process
@@ -78,8 +78,8 @@ export interface SessionActivity {
   cronNextAt?: number | null;
   /** ...until this time: the run may start late (jitter), so a grace period is added (ms). */
   cronUntil?: number | null;
-  /** When a timed wait in a command Claude started (Start-Sleep 600, sleep 10m...) ends (ms). */
-  timedWaitEndsAt?: number | null;
+  /** Commands that wait on purpose (Start-Sleep 600, a polling loop, gh run watch...). */
+  waits?: TimedWait[];
   /** The last turn ended with an API error (usage limit...): its text. */
   stoppedByError?: string | null;
 }

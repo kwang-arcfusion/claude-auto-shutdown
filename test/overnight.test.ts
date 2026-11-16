@@ -807,3 +807,26 @@ test('a usage limit ends the turn with an API error: a busy MCP server does not 
   await night.run();
   night.expectShutdownBetween('00:30', '00:32');
 });
+
+test('a background PowerShell polling loop waiting for CI is waited out, then Claude carries on', async () => {
+  const night = new Night();
+  night
+    .at('23:00', () => start(night))
+    .working(100, '23:00', '23:10')
+    .at('23:10', () => {
+      night.backgroundWait(
+        100,
+        '$deadline = (Get-Date).AddHours(2); do { Start-Sleep 30; $s = gh run view 1 --json status } until ($s -match "completed" -or (Get-Date) -gt $deadline)',
+      );
+      night.reply(100);
+    })
+    .at('00:30', () => {
+      night.backgroundEnd(100); // CI finished: Claude is told and carries on
+      night.prompt(100);
+    })
+    .working(100, '00:30', '00:40')
+    .at('00:40', () => night.reply(100));
+  await night.run();
+  night.expectNoCountdownBefore('00:40');
+  night.expectShutdownBetween('01:10', '01:12');
+});

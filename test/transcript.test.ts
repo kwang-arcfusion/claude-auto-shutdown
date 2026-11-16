@@ -9,6 +9,8 @@ import {
   classifyTranscriptLines,
   projectSlug,
   readTranscriptState,
+  MAX_OPEN_WAIT_SECONDS,
+  openEndedWait,
   timedWaitSeconds,
   TRANSCRIPT_RESCAN_MS,
   TranscriptInfoCache,
@@ -199,7 +201,7 @@ test('CronCreate / CronDelete jobs and timed waits are read from tool calls', ()
       ['d4e5', '0 9 * * *', false, Date.parse(t)],
     ],
   );
-  assert.equal(info.timedWaitEndsAt, Date.parse(t) + 600_000);
+  assert.deepEqual(info.waits, [{ at: Date.parse(t), endsAt: Date.parse(t) + 600_000 }]);
 
   const deleted = analyzeTranscriptLines([...lines, call('d1', 'CronDelete', { id: 'a1b2c3' })]);
   assert.deepEqual(
@@ -207,4 +209,32 @@ test('CronCreate / CronDelete jobs and timed waits are read from tool calls', ()
     ['d4e5'],
   );
   assert.deepEqual(deleted.deletedCrons, ['a1b2c3']);
+});
+
+test('openEndedWait spots commands that wait on purpose with no set length', () => {
+  assert.equal(openEndedWait('while (-not (Test-Path out.txt)) { Start-Sleep 30 }'), true);
+  assert.equal(openEndedWait('$deadline = (Get-Date).AddMinutes(30); do { Start-Sleep -Seconds 20 } until ((Get-Date) -gt $deadline)'), true);
+  assert.equal(openEndedWait('until [ -f build/done ]; do sleep 5; done'), true);
+  assert.equal(openEndedWait('for i in $(seq 1 60); do gh run view 1 && break; sleep 30; done'), true);
+  assert.equal(openEndedWait('for ($i = 0; $i -lt 60; $i++) { Start-Sleep 10 }'), true);
+  assert.equal(openEndedWait('gh run watch 123 --exit-status > /dev/null 2>&1'), true);
+  assert.equal(openEndedWait('gh pr checks 42 --watch'), true);
+  assert.equal(openEndedWait('Wait-Process -Id 1234'), true);
+  assert.equal(openEndedWait('docker wait my-job'), true);
+  assert.equal(openEndedWait('npm test'), false);
+  assert.equal(openEndedWait('Start-Sleep 5'), false); // a plain timed wait has its own length
+  assert.equal(openEndedWait('for f in *.ts; do echo $f; done'), false); // a loop that does not wait
+  assert.equal(openEndedWait('Write-Host "waiting for the server"; Start-Sleep 3; curl.exe localhost:3000'), false);
+});
+
+test('a polling loop counts as a wait of up to 3 hours from its call', () => {
+  const t = '2026-11-15T16:00:00.000Z';
+  const info = analyzeTranscriptLines([
+    line({
+      type: 'assistant',
+      timestamp: t,
+      message: { role: 'assistant', stop_reason: 'tool_use', content: [{ type: 'tool_use', id: 'p1', name: 'PowerShell', input: { command: 'do { Start-Sleep 30 } until (Test-Path done.txt)', run_in_background: true } }] },
+    }),
+  ]);
+  assert.deepEqual(info.waits, [{ at: Date.parse(t), endsAt: Date.parse(t) + MAX_OPEN_WAIT_SECONDS * 1000 }]);
 });

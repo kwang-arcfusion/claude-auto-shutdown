@@ -15,7 +15,7 @@ import {
   type SessionFile,
 } from './session';
 import { nextCronTime } from './cron';
-import { emptyTranscriptInfo, latestMtimeUnder, TranscriptInfoCache, TranscriptLocator, type CronJob, type TranscriptInfo } from './transcript';
+import { emptyTranscriptInfo, latestMtimeUnder, TranscriptInfoCache, TranscriptLocator, type CronJob, type TimedWait, type TranscriptInfo } from './transcript';
 import { classifyDescendants, filetimeToMs, indexProcesses, sessionIdentity, sleepEndsAt } from './tree';
 
 /** Tool processes count as active at or above this CPU use (% of one core)... */
@@ -36,6 +36,9 @@ const CRON_ONE_SHOT_GRACE_MS = 5 * 60_000;
 const CRON_MAX_AHEAD_MS = 6 * 60 * 60_000;
 /** Process creation times and file times come from different clocks. */
 const CLOCK_SLACK_MS = 2_000;
+/** A command's shell starts around the time its tool call is written: this close counts as a match. */
+const WAIT_MATCH_BEFORE_MS = 30_000;
+const WAIT_MATCH_AFTER_MS = 60_000;
 /** How deep to look in a session's side folder (workflow agents sit three levels down). */
 const SIDE_FOLDER_DEPTH = 4;
 /** How often to look again for a session's temp folders (one per project folder it used). */
@@ -126,7 +129,7 @@ function formatProblem(sessions: readonly SessionInfo[]): Message | null {
 
 /** What a session scheduled for itself, remembered across checks (the transcript tail moves on). */
 interface Remembered {
-  timedWaitEndsAt: number | null;
+  waits: Map<string, TimedWait>;
   crons: Map<string, CronJob>;
 }
 
@@ -270,11 +273,11 @@ export class ClaudeDetector implements Detector {
       let shellActiveAt: number | null = null;
       if (tools.length > 0) {
         watched.add(key);
-        toolsActiveAt = await this.toolsActiveAt(key, file.sessionId, tools, usage, checkedAt, maxAgeMs, activity[i]!.timedWaitEndsAt ?? null);
+        toolsActiveAt = await this.toolsActiveAt(key, file.sessionId, tools, usage, checkedAt, maxAgeMs, activity[i]!.waits ?? []);
       } else if (file.status === 'shell' && helpers.length > 0) {
         // Claude says a shell is running but none has a known marker: watch everything under it.
         watched.add(`${key}:shell`);
-        shellActiveAt = await this.toolsActiveAt(`${key}:shell`, file.sessionId, helpers, usage, checkedAt, maxAgeMs, activity[i]!.timedWaitEndsAt ?? null);
+        shellActiveAt = await this.toolsActiveAt(`${key}:shell`, file.sessionId, helpers, usage, checkedAt, maxAgeMs, activity[i]!.waits ?? []);
       }
       const processes: ProcessFacts = { tools, helperCpuPercent, toolsActiveAt, newestChildAt: newestCreatedAt, helpersActiveNow, shellActiveAt };
       const evaluation = evaluateSession({ file, ...activity[i]!, processes, now: checkedAt, settings });
@@ -318,7 +321,7 @@ export class ClaudeDetector implements Detector {
       }
     }
     const lastActivityAt = maxOf(transcript?.mtimeMs, file.statusUpdatedAt, file.updatedAt, activeSince);
-    const memory = this.remember(file.sessionId, info);
+    const memory = this.remember(file.sessionId, info, now);
     const schedule = this.cronSchedule(memory.crons.values(), now);
 
     // The session folder (subagent transcripts, which can number in the hundreds) only matters
@@ -349,7 +352,7 @@ export class ClaudeDetector implements Detector {
       runningSubagentAt: folder.runningSubagentAt,
       cronNextAt: schedule?.nextAt ?? null,
       cronUntil: schedule?.until ?? null,
-      timedWaitEndsAt: memory.timedWaitEndsAt,
+      waits: [...memory.waits.values()],
       stoppedByError: info.endedWithError,
     };
   }
@@ -390,14 +393,15 @@ export class ClaudeDetector implements Detector {
    * Keeps what a session scheduled (timed waits, CronCreate jobs) after it scrolls out of the
    * part of the transcript that is read: a long session can write megabytes after the call.
    */
-  private remember(sessionId: string, info: TranscriptInfo): Remembered {
+  private remember(sessionId: string, info: TranscriptInfo, now: number): Remembered {
     let memory = this.remembered.get(sessionId);
     if (!memory) {
-      memory = { timedWaitEndsAt: null, crons: new Map() };
+      memory = { waits: new Map(), crons: new Map() };
       this.remembered.set(sessionId, memory);
       if (this.remembered.size > 500) this.remembered.delete(this.remembered.keys().next().value!);
     }
-    memory.timedWaitEndsAt = maxOf(memory.timedWaitEndsAt, info.timedWaitEndsAt);
+    for (const wait of info.waits) memory.waits.set(`${wait.at}:${wait.endsAt}`, wait);
+    for (const [key, wait] of memory.waits) if (wait.endsAt < now - 60 * 60_000) memory.waits.delete(key);
     for (const job of info.crons) memory.crons.set(job.id, job);
     for (const id of info.deletedCrons) memory.crons.delete(id);
     return memory;
@@ -533,7 +537,7 @@ export class ClaudeDetector implements Detector {
     usage: Map<string, ProcActivity> | null,
     now: number,
     maxAgeMs: number,
-    timedWaitEndsAt: number | null = null,
+    waits: readonly TimedWait[] = [],
   ): Promise<number> {
     const signature = tools
       .map(procKey)
@@ -543,14 +547,17 @@ export class ClaudeDetector implements Detector {
     const watchedBefore = previous !== undefined && now - previous.observedAt <= maxAgeMs;
     let activeAt = watchedBefore ? previous.activeAt : now;
     const sum = (pick: (a: ProcActivity) => number): number => tools.reduce((total, p) => total + (usage?.get(procKey(p)) ? pick(usage.get(procKey(p))!) : 0), 0);
-    // A deliberate wait: a running `sleep N` process, or a command whose text waits
-    // (PowerShell's Start-Sleep runs inside powershell.exe, so only the command shows it).
-    const sleeping =
-      (timedWaitEndsAt !== null && now < timedWaitEndsAt + SLEEP_GRACE_MS) ||
-      tools.some((p) => {
-        const end = sleepEndsAt(p);
-        return end !== null && now < end + SLEEP_GRACE_MS;
-      });
+    // A deliberate wait: a running `sleep N` process, or the shell of a command that waits on
+    // purpose (PowerShell's Start-Sleep and polling loops run inside powershell.exe, so only the
+    // command text shows it). The shell is matched to its call by start time, so a wait never
+    // covers for another, unrelated process.
+    const sleeping = tools.some((p) => {
+      const end = sleepEndsAt(p);
+      if (end !== null && now < end + SLEEP_GRACE_MS) return true;
+      if (!p.created) return false;
+      const createdAt = filetimeToMs(p.created);
+      return waits.some((w) => now < w.endsAt + SLEEP_GRACE_MS && createdAt >= w.at - WAIT_MATCH_BEFORE_MS && createdAt <= w.at + WAIT_MATCH_AFTER_MS);
+    });
     if (
       usage === null ||
       (watchedBefore && previous.signature !== signature) ||

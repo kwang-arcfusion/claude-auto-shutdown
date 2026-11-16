@@ -42,6 +42,7 @@ Anything the app cannot read keeps the PC on.
 | Long command (build, tests) | Working while it shows CPU, disk/network I/O, output or new processes | overnight: normal night |
 | Background command after the turn ends | Working while active; finished after 20 quiet minutes | overnight: busy background task; dev server |
 | Timed wait: `sleep 600`, `Start-Sleep -Seconds 600`, `timeout /t 600` | Waited out, up to 6 h, even with no CPU or output | overnight: background PowerShell Start-Sleep; detector: timed sleep |
+| A wait with no set length: a polling loop (`do { Start-Sleep 30 } until (…)`, `until [ -f x ]; do sleep 5; done`), `gh run watch`, `Wait-Process`, `docker wait` | Its own shell counts as active until it ends, up to 3 h. The shell is matched to its tool call by start time, so the wait never covers another process | overnight: PowerShell polling loop; detector: polling loop |
 | Status `shell` with a shell the app does not recognise | Judged by the activity of everything under the session | overnight: background download |
 | Permission prompt, question, plan, MCP input (status `waiting`) | Waiting; finished 5 min after the prompt opened | overnight: status "waiting"; session tests |
 | Older Claude Code without `waiting`: a tool call that never starts | Same, guessed from the transcript and processes | overnight: unanswered permission prompt / question |
@@ -90,8 +91,9 @@ If a warning says "Claude Code may have been updated", run `npm run detect -- --
 The app cannot see these:
 
 - **Detached processes.** Commands started with `nohup … &`, `Start-Process` or `start` leave the session's process tree, and a shutdown kills them.
-- **Work outside Windows processes.** This covers WSL (vmmem), Docker containers, remote machines and cloud jobs. Only a command that waits for them (and is still running) shows up.
-- **Very quiet background work with no timed wait**, for example a poll every few minutes with tiny output. It counts as stuck after 20 minutes. Raise "Max stuck background" if you run such jobs.
+- **Work outside Windows processes.** This covers WSL (vmmem), Docker containers, remote machines and cloud jobs. Only a command that waits for them (and is still running) shows up. Their own CPU cannot tell either: Docker Desktop's processes used 9–50% CPU while idle on this PC, and the WSL VM reports none.
+- **Very quiet background work that is neither a timed wait nor a loop**, for example a single silent `docker run` job. It counts as stuck after 20 minutes. Raise "Max stuck background" if you run such jobs.
+- **A server left running (`npm run dev`) that keeps printing or using CPU.** A quiet one counts as stuck after 20 minutes and the PC shuts down; a busy one keeps it on.
 - **One MCP tool call or model response with nothing written for over 45 minutes.** It counts as stuck. Raise "Max silence" if that happens.
 - **Cron expressions with names** (`MON`, `JAN`). They are not read, so they do not keep the PC on.
 - **Claude desktop scheduled tasks**, which are separate from session `/loop` jobs.
