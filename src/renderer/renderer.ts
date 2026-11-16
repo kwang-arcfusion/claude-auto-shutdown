@@ -39,6 +39,7 @@ const VERDICT: Record<SessionVerdict, { code: MessageCode; tone: string }> = {
   waiting: { code: 'verdict.waiting', tone: 'warn' },
   scheduled: { code: 'verdict.scheduled', tone: 'busy' },
   stalled: { code: 'verdict.stalled', tone: 'idle' },
+  stopped: { code: 'verdict.stopped', tone: 'idle' },
   idle: { code: 'verdict.idle', tone: 'idle' },
 };
 

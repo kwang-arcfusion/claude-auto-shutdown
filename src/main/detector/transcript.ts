@@ -132,6 +132,8 @@ export interface TranscriptInfo {
   crons: CronJob[];
   /** Job ids deleted with CronDelete in the part that was read. */
   deletedCrons: string[];
+  /** The last turn ended with an API error (usage limit, overload...): its text. */
+  endedWithError: string | null;
 }
 
 export const emptyTranscriptInfo = (): TranscriptInfo => ({
@@ -141,6 +143,7 @@ export const emptyTranscriptInfo = (): TranscriptInfo => ({
   timedWaitEndsAt: null,
   crons: [],
   deletedCrons: [],
+  endedWithError: null,
 });
 
 export function analyzeTranscriptLines(lines: readonly string[]): TranscriptInfo {
@@ -150,9 +153,14 @@ export function analyzeTranscriptLines(lines: readonly string[]): TranscriptInfo
   const deletedCrons: string[] = [];
   let scheduledWakeAt: number | null = null;
   let timedWaitEndsAt: number | null = null;
+  let lastError: string | null = null;
   for (const line of lines) {
     const entry = parseEntry(line);
     if (!entry) continue;
+    // An API error ends the turn as an assistant entry (isApiErrorMessage, e.g. a 429 "You've hit
+    // your 5-hour limit"); any later reply or prompt means Claude went on.
+    if (entry.type === 'assistant') lastError = entry.isApiErrorMessage === true ? firstText(entry).replace(/\s+/g, ' ').trim().slice(0, 140) || 'API error' : null;
+    else if (entry.type === 'user' && entry.isMeta !== true && !blocksOf(entry).some((b) => b.type === 'tool_result')) lastError = null;
     const parsed = typeof entry.timestamp === 'string' ? Date.parse(entry.timestamp) : Number.NaN;
     const at = Number.isFinite(parsed) ? parsed : null;
     if (entry.type === 'assistant') {
@@ -198,6 +206,7 @@ export function analyzeTranscriptLines(lines: readonly string[]): TranscriptInfo
     timedWaitEndsAt,
     crons: [...crons.values()],
     deletedCrons,
+    endedWithError: lastError,
   };
 }
 

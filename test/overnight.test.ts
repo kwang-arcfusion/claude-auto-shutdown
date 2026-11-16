@@ -65,6 +65,7 @@ class Night {
   private readonly dir = mkdtempSync(path.join(os.tmpdir(), 'cas-night-'));
   private readonly sessions = new Map<number, FakeSession>();
   private readonly tools = new Map<number, FakeTool[]>();
+  private readonly helperCpu = new Map<number, { share: number; ticks: number; lastAt: number }>();
   private readonly lastToolUse = new Map<number, string>();
   private readonly events: Array<{ at: number; run: () => void }> = [];
   private readonly settings: Settings;
@@ -311,6 +312,32 @@ class Night {
     this.reply(pid);
   }
 
+  /** The session's MCP server keeps `share` of a core busy from now on. */
+  setHelperCpu(pid: number, share: number): void {
+    const ticks = this.helperTicks(pid);
+    this.helperCpu.set(pid, { share, ticks, lastAt: this.now });
+  }
+
+  /** The turn ends with an API error, as a usage limit does on Claude Code 2.1.325. */
+  apiError(pid: number, text: string): void {
+    this.append(pid, {
+      type: 'assistant',
+      isApiErrorMessage: true,
+      error: 'rate_limit',
+      apiErrorStatus: 429,
+      message: { model: '<synthetic>', stop_reason: 'stop_sequence', content: [{ type: 'text', text }] },
+    });
+    this.setStatus(pid, 'idle');
+  }
+
+  private helperTicks(pid: number): number {
+    const helper = this.helperCpu.get(pid);
+    if (!helper) return 0;
+    helper.ticks += (this.now - helper.lastAt) * 10_000 * helper.share;
+    helper.lastAt = this.now;
+    return Math.round(helper.ticks);
+  }
+
   /** The process dies and leaves its session file behind (still saying busy). */
   crash(pid: number): void {
     this.sessions.delete(pid);
@@ -450,7 +477,7 @@ class Night {
     const procs: ProcInfo[] = [];
     for (const pid of this.sessions.keys()) {
       procs.push({ pid, ppid: 1, name: 'claude.exe', created: pid * 1_000, cpuTicks: 0, ioBytes: 0, cmd: 'claude.exe --output-format stream-json' });
-      procs.push({ pid: pid + 1, ppid: pid, name: 'mcp-server.exe', created: pid * 1_000 + 1, cpuTicks: 0, ioBytes: 0, cmd: 'mcp-server.exe --stdio' });
+      procs.push({ pid: pid + 1, ppid: pid, name: 'mcp-server.exe', created: pid * 1_000 + 1, cpuTicks: this.helperTicks(pid), ioBytes: 0, cmd: 'mcp-server.exe --stdio' });
       for (const tool of this.tools.get(pid) ?? []) {
         this.advance(tool);
         procs.push({ ...tool.proc, cpuTicks: Math.round(tool.cpuTicks), ioBytes: Math.round(tool.ioBytes) });
@@ -764,4 +791,19 @@ test('an hourly /loop (CronCreate) keeps the machine on between runs until it is
   await night.run();
   night.expectNoCountdownBefore('00:06');
   night.expectShutdownBetween('00:36', '00:38');
+});
+
+test('a usage limit ends the turn with an API error: a busy MCP server does not delay the shutdown', async () => {
+  // Real night, 16 Nov: the limit hit at 04:47 and an MCP server kept the session "Background"
+  // for 20 more minutes before the countdown.
+  const night = new Night();
+  night
+    .at('23:00', () => start(night))
+    .working(100, '23:00', '00:00')
+    .at('00:00', () => {
+      night.setHelperCpu(100, 0.4);
+      night.apiError(100, "You've hit your 5-hour limit · resets 6:20am (Asia/Bangkok)");
+    });
+  await night.run();
+  night.expectShutdownBetween('00:30', '00:32');
 });

@@ -335,6 +335,10 @@ export class ClaudeDetector implements Detector {
         folder.latest = maxOf(folder.latest, found.latest);
         folder.runningSubagentAt = maxOf(folder.runningSubagentAt, found.runningSubagentAt);
       }
+      // A busy session gone quiet: its work may be written elsewhere in the project folder.
+      if (file.status === 'busy' && stalledMs > 0 && quietMs >= stalledMs && (folder.latest === null || now - folder.latest >= stalledMs)) {
+        for (const dir of new Set(copies.map((c) => path.dirname(c.file)))) folder.latest = maxOf(folder.latest, await this.projectActivityAt(dir));
+      }
     }
     return {
       transcriptState: info.state,
@@ -346,7 +350,40 @@ export class ClaudeDetector implements Detector {
       cronNextAt: schedule?.nextAt ?? null,
       cronUntil: schedule?.until ?? null,
       timedWaitEndsAt: memory.timedWaitEndsAt,
+      stoppedByError: info.endedWithError,
     };
+  }
+
+  /**
+   * Latest write anywhere in a project folder (other sessions' side folders included). A session
+   * forked from another keeps writing its subagents under the original session's folder, so before
+   * a busy session is called silent, everything in its project folder counts.
+   */
+  private async projectActivityAt(dir: string): Promise<number | null> {
+    let latest: number | null = null;
+    const walk = async (folder: string, depth: number): Promise<void> => {
+      let entries;
+      try {
+        entries = await readdir(folder, { withFileTypes: true });
+      } catch {
+        return;
+      }
+      for (const entry of entries) {
+        const full = path.join(folder, entry.name);
+        if (entry.isDirectory()) {
+          if (depth > 0 && entry.name !== 'tool-results' && entry.name !== 'memory') await walk(full, depth - 1);
+        } else if (entry.isFile()) {
+          try {
+            const mtime = (await stat(full)).mtimeMs;
+            if (latest === null || mtime > latest) latest = mtime;
+          } catch {
+            // removed meanwhile
+          }
+        }
+      }
+    };
+    await walk(dir, SIDE_FOLDER_DEPTH + 1);
+    return latest;
   }
 
   /**

@@ -46,7 +46,8 @@ Anything the app cannot read keeps the PC on.
 | Permission prompt, question, plan, MCP input (status `waiting`) | Waiting; finished 5 min after the prompt opened | overnight: status "waiting"; session tests |
 | Older Claude Code without `waiting`: a tool call that never starts | Same, guessed from the transcript and processes | overnight: unanswered permission prompt / question |
 | A slow tool (hook, big search) while status says `busy` | Working, not a prompt | session: version that reports prompts |
-| Subagent, in front or in the background | Working while its transcript is mid-turn and recent | overnight: background agent |
+| Subagent, in front or in the background | Working. From 2.1.325, Claude Code itself stays `busy` while agents run, so a subagent transcript left mid-turn after the session goes idle (cut off by a usage limit, say) is a leftover | overnight: background agent; limit tests |
+| Session forked from another (it writes its subagents under the original session's folder) | Before a quiet `busy` session is called stuck, writes anywhere in its project folder count | limit tests: forked session |
 | Workflow (multi-agent run) | Working while its agents write | overnight: long workflow |
 | `/loop` with ScheduleWakeup | Scheduled until the wake-up time + 5 min | overnight: /loop scheduled wake-ups |
 | `/loop` with a fixed interval, or a reminder (CronCreate) | Scheduled until the next run + grace (see below) | overnight: hourly /loop; cron and transcript tests |
@@ -55,7 +56,7 @@ Anything the app cannot read keeps the PC on.
 | `/clear`, resume, fork | The status file gets the new session id, which the app follows | — (verified in Claude Code) |
 | Session closed normally | Its file is removed: nothing to wait for | — |
 | Claude process crashed or was killed | Leftover file ignored (process gone or PID reused) | overnight: process dies mid-turn; detector |
-| Usage limit reached | Desktop: the turn ends, so finished. Terminal: a "Session paused" dialog (`waiting`), so finished after 5 min | — (verified in Claude Code) |
+| Usage limit reached, or another API error ends the turn | Shown as **Stopped** with the error text, and finished at once: helpers using CPU or subagents cut off mid-turn no longer delay it. A running command or a scheduled `/loop` still counts. Terminal: a "Session paused" dialog (`waiting`), so finished after 5 min | overnight: usage limit; limit tests |
 | API errors and retries | Status stays `busy` during retries (at most a few minutes): working | — |
 | PC slept and woke up | Time asleep is not counted as silence; confirmation restarts | detector: asleep; controller: wake-up tests |
 | Clock jump or missed ticks during the countdown | Confirmation restarts | controller: tick gap |

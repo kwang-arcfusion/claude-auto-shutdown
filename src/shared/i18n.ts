@@ -104,6 +104,7 @@ const EN = {
   'reason.idleUnchecked': 'Idle (background processes not checked)',
   'reason.identityUnsure': 'Cannot confirm this process belongs to the session, so not shutting down',
   'reason.unknownStatus': 'Unknown status "{status}", counted as working',
+  'reason.stoppedByError': 'Stopped by an error: {detail}',
   'what.question': 'answer a question',
   'what.input': 'provide input',
   'what.plan': 'approve a plan',
@@ -189,6 +190,7 @@ const EN = {
   'verdict.waiting': 'Waiting',
   'verdict.scheduled': 'Scheduled',
   'verdict.stalled': 'Stuck',
+  'verdict.stopped': 'Stopped',
   'verdict.idle': 'Idle',
 } as const satisfies Record<string, string>;
 
@@ -284,6 +286,7 @@ const TH: Record<MessageCode, string> = {
   'reason.idleUnchecked': 'ว่าง (ยังไม่ได้ตรวจ process เบื้องหลัง)',
   'reason.identityUnsure': 'ยืนยันไม่ได้ว่า process นี้เป็นของ session นี้ จึงยังไม่ปิดเครื่อง',
   'reason.unknownStatus': 'ไม่รู้จักสถานะ "{status}" จึงถือว่ายังทำงานอยู่',
+  'reason.stoppedByError': 'หยุดเพราะเกิดข้อผิดพลาด: {detail}',
   'what.question': 'ตอบคำถาม',
   'what.input': 'ตอบสิ่งที่ถาม',
   'what.plan': 'อนุมัติแผน',
@@ -368,6 +371,7 @@ const TH: Record<MessageCode, string> = {
   'verdict.waiting': 'รอตอบ',
   'verdict.scheduled': 'ตั้งเวลาไว้',
   'verdict.stalled': 'ค้าง',
+  'verdict.stopped': 'หยุดแล้ว',
   'verdict.idle': 'ว่าง',
 };
 

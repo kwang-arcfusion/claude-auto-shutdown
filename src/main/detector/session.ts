@@ -80,6 +80,8 @@ export interface SessionActivity {
   cronUntil?: number | null;
   /** When a timed wait in a command Claude started (Start-Sleep 600, sleep 10m...) ends (ms). */
   timedWaitEndsAt?: number | null;
+  /** The last turn ended with an API error (usage limit...): its text. */
+  stoppedByError?: string | null;
 }
 
 export interface ProcessFacts {
@@ -132,8 +134,13 @@ const HELPER_AFTER_TURN_DEFAULT_MS = 20 * MIN;
  * Anything else means its format changed.
  */
 export const KNOWN_STATUSES: ReadonlySet<string> = new Set(['busy', 'idle', 'shell', 'waiting']);
-/** From this version on, Claude Code reports prompts itself (status "waiting"), so they are not guessed. */
-const REPORTS_WAITING_FROM = '2.1.325';
+/**
+ * From this version on, Claude Code reports its own state: prompts as status "waiting", and
+ * delegated work (background agents, workflows, teammates) by staying "busy". So prompts are not
+ * guessed, and a subagent transcript left mid-turn after the session went idle is a leftover
+ * (cut off by a usage limit, say), not work.
+ */
+const REPORTS_OWN_STATE_FROM = '2.1.325';
 
 /** Tools that always wait for the user (value: what they wait for, a "what.<value>" text). */
 const QUESTION_TOOLS: Record<string, string> = { AskUserQuestion: 'question', ExitPlanMode: 'plan' };
@@ -202,7 +209,7 @@ function detectWaiting(input: EvaluateInput, busy: boolean, latest: number | nul
   if (!busy) return null;
   // A version that reports prompts itself is not waiting while it says "busy": a slow tool is
   // just slow. Older versions only show a prompt as a tool call that does not start.
-  if ((compareVersions(file.version, REPORTS_WAITING_FROM) ?? -1) >= 0) return null;
+  if ((compareVersions(file.version, REPORTS_OWN_STATE_FROM) ?? -1) >= 0) return null;
   let needsCheck = false;
   for (const tool of input.pendingTools) {
     const at = tool.at ?? latest ?? now;
@@ -301,7 +308,11 @@ export function evaluateSession(input: EvaluateInput): Evaluation {
   if (input.cronNextAt != null && input.cronUntil != null && now < input.cronUntil) {
     return result('scheduled', true, msg('reason.scheduled', { at: input.cronNextAt }));
   }
-  if (input.runningSubagentAt !== null && (stalledMs <= 0 || now - input.runningSubagentAt < stalledMs)) {
+  // The turn ended with an API error (usage limit, overload...): Claude stops there until someone
+  // acts, so guesses about background work (subagent leftovers, helper CPU) no longer matter.
+  if (input.stoppedByError) return result('stopped', false, msg('reason.stoppedByError', { detail: input.stoppedByError }));
+  const reportsOwnState = (compareVersions(file.version, REPORTS_OWN_STATE_FROM) ?? -1) >= 0;
+  if (!reportsOwnState && input.runningSubagentAt !== null && (stalledMs <= 0 || now - input.runningSubagentAt < stalledMs)) {
     return result('background', true, msg('reason.subagent'));
   }
   if (input.sideActivityAt !== null && now - input.sideActivityAt < SIDE_ACTIVITY_WINDOW_MS) {

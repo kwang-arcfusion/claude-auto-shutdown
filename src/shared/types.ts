@@ -49,6 +49,8 @@ export type SessionVerdict =
   | 'scheduled'
   /** Stuck (unanswered prompt, hung command, long silence): counts as finished. */
   | 'stalled'
+  /** The turn ended with an API error (usage limit...): Claude will not go on by itself. */
+  | 'stopped'
   | 'idle';
 
 export interface SessionInfo {
